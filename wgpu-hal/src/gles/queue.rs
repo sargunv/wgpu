@@ -478,6 +478,12 @@ impl super::Queue {
                     web_sys::WebGl2RenderingContext::UNPACK_PREMULTIPLY_ALPHA_WEBGL;
 
                 unsafe {
+                    // WebGL 2 applies the unpack layout to an image source
+                    // too, and a buffer copy leaves its own set: the last
+                    // one's row length would shear the image, and an image
+                    // taller than its image height fails (Firefox).
+                    gl.pixel_store_i32(glow::UNPACK_ROW_LENGTH, 0);
+                    gl.pixel_store_i32(glow::UNPACK_IMAGE_HEIGHT, 0);
                     if src.flip_y {
                         gl.pixel_store_bool(UNPACK_FLIP_Y_WEBGL, true);
                     }
