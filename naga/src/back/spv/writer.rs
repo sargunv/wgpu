@@ -107,6 +107,7 @@ impl Writer {
             cached_constants: crate::FastHashMap::default(),
             global_variables: HandleVec::new(),
             std140_compat_uniform_types: crate::FastHashMap::default(),
+            layout_free_type_ids: crate::FastHashMap::default(),
             fake_missing_bindings: options.fake_missing_bindings,
             binding_map: options.binding_map.clone(),
             saved_cached: CachedExpressions::default(),
@@ -206,6 +207,7 @@ impl Writer {
             cached_constants: take(&mut self.cached_constants).reclaim(),
             global_variables: take(&mut self.global_variables).reclaim(),
             std140_compat_uniform_types: take(&mut self.std140_compat_uniform_types).reclaim(),
+            layout_free_type_ids: take(&mut self.layout_free_type_ids).reclaim(),
             saved_cached: take(&mut self.saved_cached).reclaim(),
             temp_list: take(&mut self.temp_list).reclaim(),
             ray_query_functions: take(&mut self.ray_query_functions).reclaim(),
@@ -356,8 +358,38 @@ impl Writer {
         base: Handle<crate::Type>,
         class: spirv::StorageClass,
     ) -> Word {
-        let base_id = self.get_handle_type_id(base);
+        let base_id = self.type_id_for_class(base, class);
         self.get_pointer_type_id(base_id, class)
+    }
+
+    /// The id of `handle` as a variable in `space` holds it: its twin
+    /// without explicit layout where `space` forbids layout and the type
+    /// has one.
+    pub(super) fn type_id_for_space(
+        &mut self,
+        handle: Handle<crate::Type>,
+        space: crate::AddressSpace,
+    ) -> Word {
+        if space.forbids_explicit_layout() {
+            if let Some(&id) = self.layout_free_type_ids.get(&handle) {
+                return id;
+            }
+        }
+        self.get_handle_type_id(handle)
+    }
+
+    /// [`Self::type_id_for_space`], for a SPIR-V storage class.
+    pub(super) fn type_id_for_class(
+        &mut self,
+        handle: Handle<crate::Type>,
+        class: spirv::StorageClass,
+    ) -> Word {
+        if super::helpers::class_forbids_explicit_layout(class) {
+            if let Some(&id) = self.layout_free_type_ids.get(&handle) {
+                return id;
+            }
+        }
+        self.get_handle_type_id(handle)
     }
 
     pub(super) fn get_ray_query_pointer_id(&mut self) -> Word {
@@ -374,7 +406,10 @@ impl Writer {
         resolution: &TypeResolution,
         class: spirv::StorageClass,
     ) -> Word {
-        let resolution_type_id = self.get_expression_type_id(resolution);
+        let resolution_type_id = match *resolution {
+            TypeResolution::Handle(handle) => self.type_id_for_class(handle, class),
+            TypeResolution::Value(_) => self.get_expression_type_id(resolution),
+        };
         self.get_pointer_type_id(resolution_type_id, class)
     }
 
@@ -485,7 +520,7 @@ impl Writer {
                 LocalType::Cooperative(CooperativeType::from_inner(inner).unwrap())
             }
             crate::TypeInner::Pointer { base, space } => {
-                let base_type_id = self.get_handle_type_id(base);
+                let base_type_id = self.type_id_for_space(base, space);
                 LocalType::Pointer {
                     base: base_type_id,
                     class: map_storage_class(space),
@@ -1622,20 +1657,34 @@ impl Writer {
                 }
             }
 
-            let init_word = variable.init.map(|constant| context.cached[constant]);
+            let mut init_word = variable.init.map(|constant| context.cached[constant]);
             let pointer_type_id = context
                 .writer
                 .get_handle_pointer_type_id(variable.ty, spirv::StorageClass::Function);
+            let var_type_id = context
+                .writer
+                .type_id_for_class(variable.ty, spirv::StorageClass::Function);
+            if var_type_id != context.get_handle_type_id(variable.ty) {
+                // The variable holds the type's twin without layout, so its
+                // initial value goes in through `OpCopyLogical`.
+                if let Some(value_id) = init_word.take() {
+                    let copy_id = context.gen_id();
+                    prelude.body.push(Instruction::unary(
+                        spirv::Op::CopyLogical,
+                        var_type_id,
+                        copy_id,
+                        value_id,
+                    ));
+                    prelude.body.push(Instruction::store(id, copy_id, None));
+                }
+            }
             let instruction = Instruction::variable(
                 pointer_type_id,
                 id,
                 spirv::StorageClass::Function,
                 init_word.or_else(|| match ir_module.types[variable.ty].inner {
                     crate::TypeInner::RayQuery { .. } => None,
-                    _ => {
-                        let type_id = context.get_handle_type_id(variable.ty);
-                        Some(context.writer.write_constant_null(type_id))
-                    }
+                    _ => Some(context.writer.write_constant_null(var_type_id)),
                 }),
             );
 
@@ -2192,6 +2241,7 @@ impl Writer {
         &mut self,
         module: &crate::Module,
         handle: Handle<crate::Type>,
+        explicit_layout: &HandleVec<crate::Type, bool>,
     ) -> Result<Word, Error> {
         let ty = &module.types[handle];
         // If it's a type that needs SPIR-V capabilities, request them now.
@@ -2223,7 +2273,9 @@ impl Writer {
             let id = self.id_gen.next();
             let instruction = match ty.inner {
                 crate::TypeInner::Array { base, size, stride } => {
-                    self.decorate(id, Decoration::ArrayStride, &[stride]);
+                    if explicit_layout[handle] {
+                        self.decorate(id, Decoration::ArrayStride, &[stride]);
+                    }
 
                     let type_id = self.get_handle_type_id(base);
                     match size.resolve(module.to_ctx())? {
@@ -2266,7 +2318,13 @@ impl Writer {
                             }
                             _ => (),
                         }
-                        self.decorate_struct_member(id, index, member, &module.types)?;
+                        self.decorate_struct_member(
+                            id,
+                            index,
+                            member,
+                            &module.types,
+                            explicit_layout[handle],
+                        )?;
                         let member_id = self.get_handle_type_id(member.ty);
                         member_ids.push(member_id);
                     }
@@ -2305,6 +2363,149 @@ impl Writer {
         }
 
         Ok(id)
+    }
+
+    /// Which types carry explicit layout (`Offset`, `ArrayStride`,
+    /// `MatrixStride`): those a Uniform, Storage or Immediate global
+    /// reaches, where Vulkan requires it. Nothing else needs it, and
+    /// variables in other spaces mustn't have it
+    /// (`VUID-StandaloneSpirv-None-10684`).
+    fn types_with_explicit_layout(module: &crate::Module) -> HandleVec<crate::Type, bool> {
+        fn mark(
+            handle: Handle<crate::Type>,
+            types: &UniqueArena<crate::Type>,
+            flags: &mut HandleVec<crate::Type, bool>,
+        ) {
+            if flags[handle] {
+                return;
+            }
+            flags[handle] = true;
+            match types[handle].inner {
+                crate::TypeInner::Array { base, .. }
+                | crate::TypeInner::BindingArray { base, .. }
+                | crate::TypeInner::Pointer { base, .. } => mark(base, types, flags),
+                crate::TypeInner::Struct { ref members, .. } => {
+                    for member in members {
+                        mark(member.ty, types, flags);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut flags = HandleVec::with_capacity(module.types.len());
+        flags.resize(module.types.len(), false);
+        for (_, var) in module.global_variables.iter() {
+            if var.space.requires_explicit_layout() {
+                mark(var.ty, &module.types, &mut flags);
+            }
+        }
+        flags
+    }
+
+    /// Declare `handle`'s twin without explicit layout, if it needs one:
+    /// a sized array or a struct that carries layout itself or has an
+    /// element or member that has a twin. Variables in spaces that forbid
+    /// layout hold the twin, and `OpCopyLogical` (SPIR-V 1.4) converts
+    /// values on their way in and out. Types come in dependency order, so
+    /// a member's twin is declared before its struct's.
+    fn write_layout_free_type(
+        &mut self,
+        module: &crate::Module,
+        handle: Handle<crate::Type>,
+        explicit_layout: &HandleVec<crate::Type, bool>,
+    ) -> Result<(), Error> {
+        let has_twin =
+            |writer: &Self, ty: Handle<crate::Type>| writer.layout_free_type_ids.contains_key(&ty);
+        let id = match module.types[handle].inner {
+            crate::TypeInner::Array {
+                base,
+                size: size @ crate::ArraySize::Constant(_),
+                ..
+            } if explicit_layout[handle] || has_twin(self, base) => {
+                let element_id = self.type_id_for_space(base, crate::AddressSpace::Function);
+                let id = self.id_gen.next();
+                let length = match size.resolve(module.to_ctx())? {
+                    crate::proc::IndexableLength::Known(length) => length,
+                    crate::proc::IndexableLength::Dynamic => unreachable!(),
+                };
+                let length_id = self.get_index_constant(length);
+                Instruction::type_array(id, element_id, length_id)
+                    .to_words(&mut self.logical_layout.declarations);
+                id
+            }
+            crate::TypeInner::Struct { ref members, .. }
+                if (explicit_layout[handle] || members.iter().any(|m| has_twin(self, m.ty)))
+                    && !members.iter().any(|m| {
+                        matches!(
+                            module.types[m.ty].inner,
+                            crate::TypeInner::Array {
+                                size: crate::ArraySize::Dynamic,
+                                ..
+                            } | crate::TypeInner::BindingArray { .. }
+                        )
+                    }) =>
+            {
+                let member_ids: Vec<Word> = members
+                    .iter()
+                    .map(|m| self.type_id_for_space(m.ty, crate::AddressSpace::Function))
+                    .collect();
+                let id = self.id_gen.next();
+                if self.flags.contains(WriterFlags::DEBUG) {
+                    for (index, member) in members.iter().enumerate() {
+                        if let Some(ref name) = member.name {
+                            self.debugs
+                                .push(Instruction::member_name(id, index as u32, name));
+                        }
+                    }
+                }
+                Instruction::type_struct(id, &member_ids)
+                    .to_words(&mut self.logical_layout.declarations);
+                id
+            }
+            _ => return Ok(()),
+        };
+        if self.flags.contains(WriterFlags::DEBUG) {
+            if let Some(ref name) = module.types[handle].name {
+                self.debugs.push(Instruction::name(id, name));
+            }
+        }
+        self.layout_free_type_ids.insert(handle, id);
+        Ok(())
+    }
+
+    /// A constant for global const-expression `expr` as a variable in a
+    /// space that forbids layout holds it: of the twin type wherever a
+    /// composite's type has one.
+    fn get_layout_free_constant(
+        &mut self,
+        module: &crate::Module,
+        expr: Handle<crate::Expression>,
+    ) -> Word {
+        match module.global_expressions[expr] {
+            crate::Expression::Constant(constant) => {
+                self.get_layout_free_constant(module, module.constants[constant].init)
+            }
+            crate::Expression::ZeroValue(ty) => match self.layout_free_type_ids.get(&ty) {
+                Some(&twin) => self.get_constant_null(twin),
+                None => self.constant_ids[expr],
+            },
+            crate::Expression::Compose { ty, ref components } => {
+                match self.layout_free_type_ids.get(&ty) {
+                    Some(&twin) => {
+                        let ids: Vec<Word> = components
+                            .iter()
+                            .map(|&c| self.get_layout_free_constant(module, c))
+                            .collect();
+                        let id = self.id_gen.next();
+                        Instruction::constant_composite(twin, id, &ids)
+                            .to_words(&mut self.logical_layout.declarations);
+                        id
+                    }
+                    None => self.constant_ids[expr],
+                }
+            }
+            _ => self.constant_ids[expr],
+        }
     }
 
     /// Writes a std140 layout compatible type declaration for a type. Returns
@@ -2512,6 +2713,7 @@ impl Writer {
                                                 next_index as usize,
                                                 member,
                                                 &module.types,
+                                                true,
                                             )?;
                                             self.get_handle_type_id(member.ty)
                                         }
@@ -2875,7 +3077,7 @@ impl Writer {
                 // variables in the `Uniform` and `StorageBuffer` address spaces
                 // get wrapped, and we're initializing `WorkGroup` variables.
                 let var_id = self.global_variables[handle].var_id;
-                let var_type_id = self.get_handle_type_id(var.ty);
+                let var_type_id = self.type_id_for_space(var.ty, var.space);
                 let init_word = self.get_constant_null(var_type_id);
                 Instruction::store(var_id, init_word, None)
             })
@@ -3515,7 +3717,13 @@ impl Writer {
                         binding: None,
                         offset: 0,
                     };
-                    self.decorate_struct_member(wrapper_type_id, 0, &member, &ir_module.types)?;
+                    self.decorate_struct_member(
+                        wrapper_type_id,
+                        0,
+                        &member,
+                        &ir_module.types,
+                        true,
+                    )?;
 
                     Instruction::type_struct(wrapper_type_id, &[inner_type_id])
                         .to_words(&mut self.logical_layout.declarations);
@@ -3569,9 +3777,20 @@ impl Writer {
         };
 
         let init_word = match (global_variable.space, self.zero_initialize_workgroup_memory) {
-            (crate::AddressSpace::Private, _)
-            | (crate::AddressSpace::WorkGroup, super::ZeroInitializeWorkgroupMemoryMode::Native) => {
-                init_word.or_else(|| Some(self.get_constant_null(inner_type_id)))
+            (crate::AddressSpace::Private, _) => {
+                let null_type_id =
+                    self.type_id_for_space(global_variable.ty, global_variable.space);
+                match global_variable.init {
+                    Some(init) if null_type_id != inner_type_id => {
+                        Some(self.get_layout_free_constant(ir_module, init))
+                    }
+                    _ => init_word.or_else(|| Some(self.get_constant_null(null_type_id))),
+                }
+            }
+            (crate::AddressSpace::WorkGroup, super::ZeroInitializeWorkgroupMemoryMode::Native) => {
+                let null_type_id =
+                    self.type_id_for_space(global_variable.ty, global_variable.space);
+                init_word.or_else(|| Some(self.get_constant_null(null_type_id)))
             }
             _ => init_word,
         };
@@ -3591,15 +3810,18 @@ impl Writer {
         index: usize,
         member: &crate::StructMember,
         arena: &UniqueArena<crate::Type>,
+        explicit_layout: bool,
     ) -> Result<(), Error> {
         use spirv::Decoration;
 
-        self.annotations.push(Instruction::member_decorate(
-            struct_id,
-            index as u32,
-            Decoration::Offset,
-            &[member.offset],
-        ));
+        if explicit_layout {
+            self.annotations.push(Instruction::member_decorate(
+                struct_id,
+                index as u32,
+                Decoration::Offset,
+                &[member.offset],
+            ));
+        }
 
         if self.flags.contains(WriterFlags::DEBUG) {
             if let Some(ref name) = member.name {
@@ -3615,25 +3837,27 @@ impl Writer {
             member_array_subty_inner = &arena[base].inner;
         }
 
-        if let crate::TypeInner::Matrix {
-            columns: _,
-            rows,
-            scalar,
-        } = *member_array_subty_inner
-        {
-            let byte_stride = Alignment::from(rows) * scalar.width as u32;
-            self.annotations.push(Instruction::member_decorate(
-                struct_id,
-                index as u32,
-                Decoration::ColMajor,
-                &[],
-            ));
-            self.annotations.push(Instruction::member_decorate(
-                struct_id,
-                index as u32,
-                Decoration::MatrixStride,
-                &[byte_stride],
-            ));
+        if explicit_layout {
+            if let crate::TypeInner::Matrix {
+                columns: _,
+                rows,
+                scalar,
+            } = *member_array_subty_inner
+            {
+                let byte_stride = Alignment::from(rows) * scalar.width as u32;
+                self.annotations.push(Instruction::member_decorate(
+                    struct_id,
+                    index as u32,
+                    Decoration::ColMajor,
+                    &[],
+                ));
+                self.annotations.push(Instruction::member_decorate(
+                    struct_id,
+                    index as u32,
+                    Decoration::MatrixStride,
+                    &[byte_stride],
+                ));
+            }
         }
 
         Ok(())
@@ -3756,9 +3980,16 @@ impl Writer {
             }
         }
 
-        // write all types
+        // write all types, and from SPIR-V 1.4 (`OpCopyLogical`) the twins
+        // without layout that variables in Function, Private and Workgroup
+        // hold
+        let explicit_layout = Self::types_with_explicit_layout(ir_module);
+        let twins = self.lang_version() >= (1, 4);
         for (handle, _) in ir_module.types.iter() {
-            self.write_type_declaration_arena(ir_module, handle)?;
+            self.write_type_declaration_arena(ir_module, handle, &explicit_layout)?;
+            if twins {
+                self.write_layout_free_type(ir_module, handle, &explicit_layout)?;
+            }
         }
 
         // write std140 layout compatible types required by uniforms

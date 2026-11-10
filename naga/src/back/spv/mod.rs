@@ -961,6 +961,12 @@ pub struct Writer {
     cached_constants: crate::FastHashMap<CachedConstant, Word>,
     global_variables: HandleVec<crate::GlobalVariable, GlobalVariable>,
     std140_compat_uniform_types: crate::FastHashMap<Handle<crate::Type>, Std140CompatTypeInfo>,
+    /// SPIR-V ids of undecorated twins of types that carry explicit layout
+    /// (or contain one that does), for variables in spaces that forbid it
+    /// (`forbids_explicit_layout`). Absent means the type's own id serves.
+    /// Only populated on SPIR-V 1.4+, where `OpCopyLogical` converts values
+    /// between a type and its twin.
+    layout_free_type_ids: crate::FastHashMap<Handle<crate::Type>, Word>,
     fake_missing_bindings: bool,
     binding_map: BindingMap,
 

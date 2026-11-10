@@ -2766,6 +2766,44 @@ impl BlockContext<'_> {
         }
     }
 
+    fn copy_logical(&mut self, value_id: Word, result_type_id: Word, block: &mut Block) -> Word {
+        let result_id = self.gen_id();
+        block.body.push(Instruction::unary(
+            spirv::Op::CopyLogical,
+            result_type_id,
+            result_id,
+            value_id,
+        ));
+        result_id
+    }
+
+    /// `ty`'s twin without explicit layout, if it has one: what variables
+    /// in spaces that forbid layout hold.
+    fn layout_free_type_id(&mut self, ty: Handle<crate::Type>) -> Option<Word> {
+        self.writer.layout_free_type_ids.get(&ty).copied()
+    }
+
+    fn maybe_convert_value_for_layout_free_store(
+        &mut self,
+        pointer: Handle<crate::Expression>,
+        value: Handle<crate::Expression>,
+        block: &mut Block,
+    ) -> Word {
+        let value_id = self.cached[value];
+        let crate::TypeInner::Pointer { base, space } =
+            *self.fun_info[pointer].ty.inner_with(&self.ir_module.types)
+        else {
+            return value_id;
+        };
+        if !space.forbids_explicit_layout() {
+            return value_id;
+        }
+        match self.layout_free_type_id(base) {
+            Some(twin_id) => self.copy_logical(value_id, twin_id, block),
+            None => value_id,
+        }
+    }
+
     fn write_checked_load(
         &mut self,
         pointer: Handle<crate::Expression>,
@@ -2790,30 +2828,45 @@ impl BlockContext<'_> {
                 r#type: Handle<crate::Type>,
             }
             let mut wrapped_load = None;
+            let mut layout_free_load_type_id = None;
+            // A component of a spilled composite (`IntroducePointer`) lies
+            // in a Function variable, which holds twins without layout.
+            if let AccessTypeAdjustment::IntroducePointer(class) = access_type_adjustment {
+                if super::helpers::class_forbids_explicit_layout(class) {
+                    if let Some(handle) = self.fun_info[pointer].ty.handle() {
+                        layout_free_load_type_id = self.layout_free_type_id(handle);
+                    }
+                }
+            }
             if let crate::TypeInner::Pointer {
                 base: pointer_base_type,
-                space: crate::AddressSpace::Uniform,
+                space,
             } = *self.fun_info[pointer].ty.inner_with(&self.ir_module.types)
             {
-                if self
-                    .writer
-                    .std140_compat_uniform_types
-                    .contains_key(&pointer_base_type)
+                if space == crate::AddressSpace::Uniform
+                    && self
+                        .writer
+                        .std140_compat_uniform_types
+                        .contains_key(&pointer_base_type)
                 {
                     wrapped_load = Some(WrappedLoad {
                         access_type_adjustment: AccessTypeAdjustment::UseStd140CompatType,
                         r#type: pointer_base_type,
                     });
-                };
+                } else if space.forbids_explicit_layout() {
+                    layout_free_load_type_id = self.layout_free_type_id(pointer_base_type);
+                }
             };
 
-            let (load_type_id, access_type_adjustment) = match wrapped_load {
-                Some(ref wrapped_load) => (
-                    self.writer.std140_compat_uniform_types[&wrapped_load.r#type].type_id,
-                    wrapped_load.access_type_adjustment,
-                ),
-                None => (result_type_id, access_type_adjustment),
-            };
+            let (load_type_id, access_type_adjustment) =
+                match (wrapped_load.as_ref(), layout_free_load_type_id) {
+                    (Some(wrapped_load), _) => (
+                        self.writer.std140_compat_uniform_types[&wrapped_load.r#type].type_id,
+                        wrapped_load.access_type_adjustment,
+                    ),
+                    (None, Some(wg_type_id)) => (wg_type_id, access_type_adjustment),
+                    (None, None) => (result_type_id, access_type_adjustment),
+                };
 
             let load_id = match self.write_access_chain(pointer, block, access_type_adjustment)? {
                 ExpressionPointer::Ready { pointer_id } => {
@@ -2885,6 +2938,9 @@ impl BlockContext<'_> {
                     ));
                     Ok(result_id)
                 }
+                None if layout_free_load_type_id.is_some() => {
+                    Ok(self.copy_logical(load_id, result_type_id, block))
+                }
                 None => Ok(load_id),
             }
         }
@@ -2941,7 +2997,14 @@ impl BlockContext<'_> {
         // variable for `a` has already been declared, but it is still essential
         // that we store `a` into it, so that `a[z]` sees this iteration's value
         // of `a`.
-        let base_id = self.cached[base];
+        let mut base_id = self.cached[base];
+        if let Some(twin_id) = self.fun_info[base]
+            .ty
+            .handle()
+            .and_then(|handle| self.layout_free_type_id(handle))
+        {
+            base_id = self.copy_logical(base_id, twin_id, block);
+        }
         block
             .body
             .push(Instruction::store(spill_variable_id, base_id, None));
@@ -3778,7 +3841,8 @@ impl BlockContext<'_> {
                     self.writer.write_memory_barrier(flags, &mut block);
                 }
                 Statement::Store { pointer, value } => {
-                    let value_id = self.cached[value];
+                    let value_id =
+                        self.maybe_convert_value_for_layout_free_store(pointer, value, &mut block);
                     match self.write_access_chain(
                         pointer,
                         &mut block,

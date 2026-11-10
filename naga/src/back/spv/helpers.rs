@@ -94,6 +94,32 @@ impl crate::AddressSpace {
             _ => (spirv::MemorySemantics::empty(), spirv::Scope::Invocation),
         }
     }
+
+    /// Whether variables in this space must have `Offset`/`ArrayStride`/`MatrixStride`.
+    pub(super) const fn requires_explicit_layout(self) -> bool {
+        matches!(self, Self::Uniform | Self::Storage { .. } | Self::Immediate)
+    }
+
+    /// Whether variables in this space must not have explicit layout decorations
+    /// (`VUID-StandaloneSpirv-None-10684`): Workgroup always (without
+    /// `workgroupMemoryExplicitLayout`), Function and Private from SPIR-V 1.5.
+    pub(super) const fn forbids_explicit_layout(self) -> bool {
+        matches!(
+            self,
+            Self::WorkGroup | Self::TaskPayload | Self::Function | Self::Private
+        )
+    }
+}
+
+/// [`crate::AddressSpace::forbids_explicit_layout`], for a SPIR-V storage class.
+pub(super) const fn class_forbids_explicit_layout(class: spirv::StorageClass) -> bool {
+    matches!(
+        class,
+        spirv::StorageClass::Workgroup
+            | spirv::StorageClass::TaskPayloadWorkgroupEXT
+            | spirv::StorageClass::Function
+            | spirv::StorageClass::Private
+    )
 }
 
 /// Return true if the global requires a type decorated with `Block`.
