@@ -316,13 +316,16 @@ impl super::Adapter {
         };
 
         // Native render passes (`BeginRenderPass`) carry each attachment's
-        // load, store and resolve, so a tiling GPU (Adreno) can keep
-        // multisampled attachments on chip, resolve them there, and drop
-        // what a pass discards. `OMSetRenderTargets` can't say any of that.
-        // Like Dawn, use them where the runtime reports them valid
-        // (`OPTIONS18`, with the read-only depth and stencil flags) and
-        // the driver isn't one Dawn knows to break them;
-        // `WGPU_DX12_RENDER_PASSES=0` or `1` turns them off or on.
+        // load, store and resolve, which `OMSetRenderTargets` can't say, so
+        // a tiling GPU could keep multisampled attachments on chip. They
+        // are off unless `WGPU_DX12_RENDER_PASSES=1` turns them on, and
+        // then only where the runtime reports them valid (`OPTIONS18`,
+        // with the read-only depth and stencil flags, as Dawn checks) and
+        // the driver isn't one Dawn knows to break. Measured, they don't
+        // pay: on the Adreno X1-85 (Qualcomm 31.0.133.1), the tiler they
+        // were for, a 4x multisampled pass that clears, resolves and
+        // discards took 19.0 ms against 16.1 ms on the old path, with
+        // identical pixels; immediate-mode GPUs have little to gain.
         let render_passes = {
             let mut features18 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS18::default();
             let valid = unsafe {
@@ -352,11 +355,8 @@ impl super::Adapter {
                     size_of_val(&features5) as u32,
                 )
             };
-            let render_passes = match std::env::var("WGPU_DX12_RENDER_PASSES").as_deref() {
-                Ok("0") => false,
-                Ok("1") => true,
-                _ => valid,
-            };
+            let render_passes =
+                valid && std::env::var("WGPU_DX12_RENDER_PASSES").as_deref() == Ok("1");
             log::info!(
                 "{}: render passes {} (RenderPassesValid {valid}, tier {})",
                 info.name,
