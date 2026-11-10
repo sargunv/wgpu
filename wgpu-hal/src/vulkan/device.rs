@@ -249,10 +249,21 @@ impl super::DeviceShared {
     }
 }
 
-struct CompiledStage {
+struct CompiledStage<'a> {
     create_info: vk::PipelineShaderStageCreateInfo<'static>,
     _entry_point: CString,
-    temp_raw_module: Option<vk::ShaderModule>,
+    /// The module made from naga's SPIR-V for this pipeline alone, and the
+    /// device it was made on: destroyed when the stage drops, whether the
+    /// pipeline was made or a later stage or the driver failed it.
+    temp_raw_module: Option<(&'a ash::Device, vk::ShaderModule)>,
+}
+
+impl Drop for CompiledStage<'_> {
+    fn drop(&mut self) {
+        if let Some((device, raw_module)) = self.temp_raw_module.take() {
+            unsafe { device.destroy_shader_module(raw_module, None) };
+        }
+    }
 }
 
 struct MemoryProperties {
@@ -701,7 +712,7 @@ impl super::Device {
         stage: &crate::ProgrammableStage<super::ShaderModule>,
         naga_stage: naga::ShaderStage,
         binding_map: &naga::back::spv::BindingMap,
-    ) -> Result<CompiledStage, crate::PipelineError> {
+    ) -> Result<CompiledStage<'_>, crate::PipelineError> {
         let stage_flags = crate::auxil::map_naga_stage(naga_stage);
         let vk_module = match *stage.module {
             super::ShaderModule::Raw(raw) => raw,
@@ -805,7 +816,7 @@ impl super::Device {
             _entry_point: entry_point,
             temp_raw_module: match *stage.module {
                 super::ShaderModule::Raw(_) => None,
-                super::ShaderModule::Intermediate { .. } => Some(vk_module),
+                super::ShaderModule::Intermediate { .. } => Some((&self.shared.raw, vk_module)),
             },
         })
     }
@@ -2181,34 +2192,8 @@ impl crate::Device for super::Device {
             unsafe { self.shared.set_object_name(raw, label) };
         }
 
-        if let Some(CompiledStage {
-            temp_raw_module: Some(raw_module),
-            ..
-        }) = compiled_vs
-        {
-            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
-        }
-        if let Some(CompiledStage {
-            temp_raw_module: Some(raw_module),
-            ..
-        }) = compiled_ts
-        {
-            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
-        }
-        if let Some(CompiledStage {
-            temp_raw_module: Some(raw_module),
-            ..
-        }) = compiled_ms
-        {
-            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
-        }
-        if let Some(CompiledStage {
-            temp_raw_module: Some(raw_module),
-            ..
-        }) = compiled_fs
-        {
-            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
-        }
+        // The stages' temporary modules go as they drop.
+        drop((compiled_vs, compiled_ts, compiled_ms, compiled_fs));
 
         self.counters.render_pipelines.add(1);
 
@@ -2264,9 +2249,7 @@ impl crate::Device for super::Device {
             unsafe { self.shared.set_object_name(raw, label) };
         }
 
-        if let Some(raw_module) = compiled.temp_raw_module {
-            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
-        }
+        drop(compiled);
 
         self.counters.compute_pipelines.add(1);
 
@@ -2397,20 +2380,7 @@ impl crate::Device for super::Device {
             .map_err(|(_, e)| super::map_pipeline_err(e))
         }?;
 
-        if let Some(raw_module) = compiled_ray_gen.temp_raw_module {
-            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
-        }
-
-        if let Some(raw_module) = compiled_miss.temp_raw_module {
-            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
-        }
-
-        for raw_module in compiled_stages
-            .into_iter()
-            .flat_map(|stage| stage.temp_raw_module)
-        {
-            unsafe { self.shared.raw.destroy_shader_module(raw_module, None) };
-        }
+        drop((compiled_ray_gen, compiled_miss, compiled_stages));
 
         self.counters.ray_tracing_pipelines.add(1);
 
