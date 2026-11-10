@@ -32,6 +32,9 @@ struct ImageCoordinates {
     /// The number of components in `value`, if it is a vector, or `None` if it
     /// is a scalar.
     size: Option<crate::VectorSize>,
+
+    /// The scalar type of `value`'s components.
+    scalar: crate::Scalar,
 }
 
 /// A trait for image access (load or store) code generators.
@@ -274,15 +277,16 @@ impl BlockContext<'_> {
             None => {
                 let value_id = coordinates_id;
                 let type_id = self.get_expression_type_id(ty);
-                let size = match *inner_ty {
-                    Ti::Scalar { .. } => None,
-                    Ti::Vector { size, .. } => Some(size),
+                let (size, scalar) = match *inner_ty {
+                    Ti::Scalar(scalar) => (None, scalar),
+                    Ti::Vector { size, scalar } => (Some(size), scalar),
                     _ => return Err(Error::Validation("coordinate type")),
                 };
                 return Ok(ImageCoordinates {
                     value_id,
                     type_id,
                     size,
+                    scalar,
                 });
             }
             Some(ix) => ix,
@@ -369,6 +373,7 @@ impl BlockContext<'_> {
             value_id,
             type_id,
             size: Some(size),
+            scalar: component_scalar,
         })
     }
 
@@ -401,7 +406,12 @@ impl BlockContext<'_> {
     /// If `coordinates` is a scalar, return a scalar one. Otherwise, return
     /// a vector of ones.
     fn write_coordinate_one(&mut self, coordinates: &ImageCoordinates) -> Result<Word, Error> {
-        let one = self.get_scope_constant(1);
+        // A one of the coordinates' own type: `u32` coordinates (with an
+        // array index, a `vec3<u32>`) take a `u32` one.
+        let one = match coordinates.scalar.kind {
+            crate::ScalarKind::Uint => self.writer.get_constant_scalar(crate::Literal::U32(1)),
+            _ => self.get_scope_constant(1),
+        };
         match coordinates.size {
             None => Ok(one),
             Some(vector_size) => {
