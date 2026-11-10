@@ -98,6 +98,19 @@ impl super::Queue {
         if self.features.contains(wgt::Features::DEPTH_CLIP_CONTROL) {
             unsafe { gl.disable(glow::DEPTH_CLAMP) };
         }
+        // WebGPU restarts strips at the index format's largest value, as
+        // WebGL 2 always does; GLES 3.0 and GL 4.3 do once it's enabled.
+        // Without it the index is drawn as a vertex, and ANGLE drops a
+        // whole draw holding a 32-bit one past its vertex range.
+        #[cfg(not(webgl))]
+        if self.shared.es
+            || matches!(
+                self.shared.shading_language_version,
+                naga::back::glsl::Version::Desktop(v) if v >= 430
+            )
+        {
+            unsafe { gl.enable(glow::PRIMITIVE_RESTART_FIXED_INDEX) };
+        }
 
         unsafe { gl.bind_buffer(glow::ELEMENT_ARRAY_BUFFER, None) };
         let mut current_index_buffer = self.current_index_buffer.lock();
