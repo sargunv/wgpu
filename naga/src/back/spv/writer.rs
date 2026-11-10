@@ -2464,9 +2464,14 @@ impl Writer {
             }
             _ => return Ok(()),
         };
+        // Named apart from the type it twins: SPIRV-Cross (MoltenVK) takes a
+        // struct named like a logically equivalent one as an alias of it, and
+        // would declare a twin holding twins as the original, whose members
+        // are the decorated types.
         if self.flags.contains(WriterFlags::DEBUG) {
             if let Some(ref name) = module.types[handle].name {
-                self.debugs.push(Instruction::name(id, name));
+                let name = format!("{name}_layout_free");
+                self.debugs.push(Instruction::name(id, &name));
             }
         }
         self.layout_free_type_ids.insert(handle, id);
