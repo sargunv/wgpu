@@ -179,6 +179,7 @@ impl super::Device {
             )?,
             sampler_heap: super::sampler::SamplerHeap::new(&raw, &private_caps)?,
             private_caps,
+            render_uav_writes: false.into(),
         };
 
         let mut rtv_pool =
@@ -829,6 +830,7 @@ impl crate::Device for super::Device {
             free_lists: Vec::new(),
             pass: super::PassState::new(),
             temp: super::Temp::default(),
+            resolve_regions: Default::default(),
             end_of_pass_timer_query: None,
             counters: Arc::clone(&self.counters),
         })
@@ -985,6 +987,25 @@ impl crate::Device for super::Device {
             let mut sampler_in_bind_group = false;
 
             for entry in &bgl.entries {
+                let writes = match entry.ty {
+                    wgt::BindingType::Buffer {
+                        ty: wgt::BufferBindingType::Storage { read_only },
+                        ..
+                    } => !read_only,
+                    wgt::BindingType::StorageTexture { access, .. } => {
+                        access != wgt::StorageTextureAccess::ReadOnly
+                    }
+                    _ => false,
+                };
+                if writes
+                    && !entry
+                        .visibility
+                        .difference(wgt::ShaderStages::COMPUTE)
+                        .is_empty()
+                {
+                    (self.shared.render_uav_writes)
+                        .store(true, core::sync::atomic::Ordering::Relaxed);
+                }
                 match entry.ty {
                     wgt::BindingType::Buffer {
                         ty: wgt::BufferBindingType::Uniform,

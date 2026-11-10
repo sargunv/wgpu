@@ -19,6 +19,46 @@ use crate::{
     AccelerationStructureEntries, CommandEncoder as _,
 };
 
+/// How a render pass begins on an attachment its `ops` load: cleared to
+/// `clear`, discarded, or preserved.
+fn beginning_access(
+    ops: crate::AttachmentOps,
+    clear: Direct3D12::D3D12_CLEAR_VALUE,
+) -> Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS {
+    if ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
+        Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS {
+            Type: Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_CLEAR,
+            Anonymous: Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS_0 {
+                Clear: Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS_CLEAR_PARAMETERS {
+                    ClearValue: clear,
+                },
+            },
+        }
+    } else {
+        Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS {
+            Type: if ops.contains(crate::AttachmentOps::LOAD_DONT_CARE) {
+                Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_DISCARD
+            } else {
+                Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_PRESERVE
+            },
+            ..Default::default()
+        }
+    }
+}
+
+/// How a render pass ends on an attachment it doesn't resolve: discarded
+/// or preserved, as its `ops` store.
+fn ending_access(ops: crate::AttachmentOps) -> Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS {
+    Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS {
+        Type: if ops.contains(crate::AttachmentOps::STORE_DISCARD) {
+            Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_DISCARD
+        } else {
+            Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_PRESERVE
+        },
+        ..Default::default()
+    }
+}
+
 fn make_box(origin: &wgt::Origin3d, size: &crate::CopyExtent) -> Direct3D12::D3D12_BOX {
     Direct3D12::D3D12_BOX {
         left: origin.x,
@@ -951,68 +991,229 @@ impl crate::CommandEncoder for super::CommandEncoder {
         });
 
         let list = self.list.as_ref().unwrap();
-        unsafe {
-            list.OMSetRenderTargets(
-                desc.color_attachments.len() as u32,
-                Some(color_views.as_ptr()),
-                false,
-                ds_view.as_ref().map(core::ptr::from_ref),
-            )
-        };
 
         self.pass.resolves.clear();
-        for (rtv, cat) in color_views.iter().zip(desc.color_attachments.iter()) {
-            if let Some(cat) = cat.as_ref() {
-                if cat.ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
-                    let value = [
-                        cat.clear_value.r as f32,
-                        cat.clear_value.g as f32,
-                        cat.clear_value.b as f32,
-                        cat.clear_value.a as f32,
-                    ];
-                    unsafe { list.ClearRenderTargetView(*rtv, &value, None) };
-                }
-                if let Some(ref target) = cat.resolve_target {
-                    self.pass.resolves.push(super::PassResolve {
-                        src: (
-                            cat.target.view.texture.clone(),
-                            cat.target.view.subresource_index,
-                        ),
-                        dst: (target.view.texture.clone(), target.view.subresource_index),
-                        format: target.view.raw_format,
-                    });
-                }
+        for cat in desc.color_attachments.iter().flatten() {
+            if let Some(ref target) = cat.resolve_target {
+                self.pass.resolves.push(super::PassResolve {
+                    src: (
+                        cat.target.view.texture.clone(),
+                        cat.target.view.subresource_index,
+                    ),
+                    dst: (target.view.texture.clone(), target.view.subresource_index),
+                    format: target.view.raw_format,
+                });
             }
         }
 
-        if let Some(ref ds) = desc.depth_stencil_attachment {
-            let mut flags = Direct3D12::D3D12_CLEAR_FLAGS::default();
-            let aspects = ds.target.view.aspects;
-            if ds.depth_ops.contains(crate::AttachmentOps::LOAD_CLEAR)
-                && aspects.contains(crate::FormatAspects::DEPTH)
+        let render_pass = if self.shared.private_caps.render_passes {
+            list.cast::<Direct3D12::ID3D12GraphicsCommandList4>().ok()
+        } else {
+            None
+        };
+        if let Some(ref list4) = render_pass {
+            // Each attachment's load, store and resolve, for the driver to
+            // keep what it can on chip.
+            let mut targets = arrayvec::ArrayVec::<
+                Direct3D12::D3D12_RENDER_PASS_RENDER_TARGET_DESC,
+                { crate::MAX_COLOR_ATTACHMENTS },
+            >::new();
+            for (i, (rtv, cat)) in color_views
+                .iter()
+                .zip(desc.color_attachments.iter())
+                .enumerate()
             {
-                flags |= Direct3D12::D3D12_CLEAR_FLAG_DEPTH;
-            }
-            if ds.stencil_ops.contains(crate::AttachmentOps::LOAD_CLEAR)
-                && aspects.contains(crate::FormatAspects::STENCIL)
-            {
-                flags |= Direct3D12::D3D12_CLEAR_FLAG_STENCIL;
+                let Some(cat) = cat.as_ref() else {
+                    // A hole keeps its slot: a null view, preserved.
+                    targets.push(Direct3D12::D3D12_RENDER_PASS_RENDER_TARGET_DESC {
+                        cpuDescriptor: *rtv,
+                        BeginningAccess: beginning_access(
+                            crate::AttachmentOps::LOAD,
+                            Default::default(),
+                        ),
+                        EndingAccess: ending_access(crate::AttachmentOps::STORE),
+                    });
+                    continue;
+                };
+                let clear = Direct3D12::D3D12_CLEAR_VALUE {
+                    Format: cat.target.view.raw_format,
+                    Anonymous: Direct3D12::D3D12_CLEAR_VALUE_0 {
+                        Color: [
+                            cat.clear_value.r as f32,
+                            cat.clear_value.g as f32,
+                            cat.clear_value.b as f32,
+                            cat.clear_value.a as f32,
+                        ],
+                    },
+                };
+                let ending = match cat.resolve_target {
+                    Some(ref target) => {
+                        self.resolve_regions[i] =
+                            Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS {
+                                SrcSubresource: cat.target.view.subresource_index,
+                                DstSubresource: target.view.subresource_index,
+                                DstX: 0,
+                                DstY: 0,
+                                SrcRect: Foundation::RECT {
+                                    left: 0,
+                                    top: 0,
+                                    right: desc.extent.width as i32,
+                                    bottom: desc.extent.height as i32,
+                                },
+                            };
+                        Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS {
+                            Type: Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_RESOLVE,
+                            Anonymous: Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS_0 {
+                                Resolve: mem::ManuallyDrop::new(
+                                    Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_PARAMETERS {
+                                        // `self.pass.resolves` holds both.
+                                        pSrcResource: unsafe {
+                                            borrow_interface_temporarily(&cat.target.view.texture)
+                                        },
+                                        pDstResource: unsafe {
+                                            borrow_interface_temporarily(&target.view.texture)
+                                        },
+                                        SubresourceCount: 1,
+                                        pSubresourceParameters: &self.resolve_regions[i],
+                                        Format: target.view.raw_format,
+                                        ResolveMode: Direct3D12::D3D12_RESOLVE_MODE_AVERAGE,
+                                        PreserveResolveSource: cat
+                                            .ops
+                                            .contains(crate::AttachmentOps::STORE)
+                                            .into(),
+                                    },
+                                ),
+                            },
+                        }
+                    }
+                    None => ending_access(cat.ops),
+                };
+                targets.push(Direct3D12::D3D12_RENDER_PASS_RENDER_TARGET_DESC {
+                    cpuDescriptor: *rtv,
+                    BeginningAccess: beginning_access(cat.ops, clear),
+                    EndingAccess: ending,
+                });
             }
 
-            if let Some(ds_view) = ds_view {
-                if flags != Direct3D12::D3D12_CLEAR_FLAGS::default() {
-                    unsafe {
-                        list.ClearDepthStencilView(
-                            ds_view,
-                            flags,
-                            ds.clear_value.0,
-                            ds.clear_value.1 as u8,
-                            None,
-                        )
+            let mut flags = if self
+                .shared
+                .render_uav_writes
+                .load(core::sync::atomic::Ordering::Relaxed)
+            {
+                Direct3D12::D3D12_RENDER_PASS_FLAG_ALLOW_UAV_WRITES
+            } else {
+                Direct3D12::D3D12_RENDER_PASS_FLAG_NONE
+            };
+            let depth_stencil = desc
+                .depth_stencil_attachment
+                .as_ref()
+                .zip(ds_view)
+                .map(|(ds, ds_view)| {
+                    let aspects = ds.target.view.aspects;
+                    if ds.target.usage != wgt::TextureUses::DEPTH_STENCIL_WRITE {
+                        if aspects.contains(crate::FormatAspects::DEPTH) {
+                            flags |= Direct3D12::D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_DEPTH;
+                        }
+                        if aspects.contains(crate::FormatAspects::STENCIL) {
+                            flags |= Direct3D12::D3D12_RENDER_PASS_FLAG_BIND_READ_ONLY_STENCIL;
+                        }
+                    }
+                    let clear = Direct3D12::D3D12_CLEAR_VALUE {
+                        Format: ds.target.view.raw_format,
+                        Anonymous: Direct3D12::D3D12_CLEAR_VALUE_0 {
+                            DepthStencil: Direct3D12::D3D12_DEPTH_STENCIL_VALUE {
+                                Depth: ds.clear_value.0,
+                                Stencil: ds.clear_value.1 as u8,
+                            },
+                        },
+                    };
+                    let access = |aspect, ops| {
+                        if aspects.contains(aspect) {
+                            (beginning_access(ops, clear), ending_access(ops))
+                        } else {
+                            (
+                                Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS {
+                                    Type: Direct3D12::D3D12_RENDER_PASS_BEGINNING_ACCESS_TYPE_NO_ACCESS,
+                                    ..Default::default()
+                                },
+                                Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS {
+                                    Type: Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS_TYPE_NO_ACCESS,
+                                    ..Default::default()
+                                },
+                            )
+                        }
+                    };
+                    let depth = access(crate::FormatAspects::DEPTH, ds.depth_ops);
+                    let stencil = access(crate::FormatAspects::STENCIL, ds.stencil_ops);
+                    Direct3D12::D3D12_RENDER_PASS_DEPTH_STENCIL_DESC {
+                        cpuDescriptor: ds_view,
+                        DepthBeginningAccess: depth.0,
+                        StencilBeginningAccess: stencil.0,
+                        DepthEndingAccess: depth.1,
+                        StencilEndingAccess: stencil.1,
+                    }
+                });
+            unsafe {
+                list4.BeginRenderPass(
+                    Some(&targets),
+                    depth_stencil.as_ref().map(core::ptr::from_ref),
+                    flags,
+                )
+            };
+        } else {
+            unsafe {
+                list.OMSetRenderTargets(
+                    desc.color_attachments.len() as u32,
+                    Some(color_views.as_ptr()),
+                    false,
+                    ds_view.as_ref().map(core::ptr::from_ref),
+                )
+            };
+
+            for (rtv, cat) in color_views.iter().zip(desc.color_attachments.iter()) {
+                if let Some(cat) = cat.as_ref() {
+                    if cat.ops.contains(crate::AttachmentOps::LOAD_CLEAR) {
+                        let value = [
+                            cat.clear_value.r as f32,
+                            cat.clear_value.g as f32,
+                            cat.clear_value.b as f32,
+                            cat.clear_value.a as f32,
+                        ];
+                        unsafe { list.ClearRenderTargetView(*rtv, &value, None) };
+                    }
+                }
+            }
+
+            if let Some(ref ds) = desc.depth_stencil_attachment {
+                let mut flags = Direct3D12::D3D12_CLEAR_FLAGS::default();
+                let aspects = ds.target.view.aspects;
+                if ds.depth_ops.contains(crate::AttachmentOps::LOAD_CLEAR)
+                    && aspects.contains(crate::FormatAspects::DEPTH)
+                {
+                    flags |= Direct3D12::D3D12_CLEAR_FLAG_DEPTH;
+                }
+                if ds.stencil_ops.contains(crate::AttachmentOps::LOAD_CLEAR)
+                    && aspects.contains(crate::FormatAspects::STENCIL)
+                {
+                    flags |= Direct3D12::D3D12_CLEAR_FLAG_STENCIL;
+                }
+
+                if let Some(ds_view) = ds_view {
+                    if flags != Direct3D12::D3D12_CLEAR_FLAGS::default() {
+                        unsafe {
+                            list.ClearDepthStencilView(
+                                ds_view,
+                                flags,
+                                ds.clear_value.0,
+                                ds.clear_value.1 as u8,
+                                None,
+                            )
+                        }
                     }
                 }
             }
         }
+        self.pass.render_pass = render_pass;
 
         if let Some(multiview_mask) = desc.multiview_mask {
             unsafe {
@@ -1043,7 +1244,39 @@ impl crate::CommandEncoder for super::CommandEncoder {
     }
 
     unsafe fn end_render_pass(&mut self) {
-        if !self.pass.resolves.is_empty() {
+        if let Some(list4) = self.pass.render_pass.take() {
+            // The pass resolves as it ends, from the source as it drew
+            // (`RENDER_TARGET`) into a destination in `RESOLVE_DEST`. As
+            // in Dawn, the destination turns just before the pass ends.
+            self.temp.barriers.clear();
+            for resolve in self.pass.resolves.iter() {
+                self.temp.barriers.push(Direct3D12::D3D12_RESOURCE_BARRIER {
+                    Type: Direct3D12::D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
+                    Flags: Direct3D12::D3D12_RESOURCE_BARRIER_FLAG_NONE,
+                    Anonymous: Direct3D12::D3D12_RESOURCE_BARRIER_0 {
+                        Transition: mem::ManuallyDrop::new(
+                            Direct3D12::D3D12_RESOURCE_TRANSITION_BARRIER {
+                                pResource: unsafe { borrow_interface_temporarily(&resolve.dst.0) },
+                                Subresource: resolve.dst.1,
+                                StateBefore: Direct3D12::D3D12_RESOURCE_STATE_RENDER_TARGET,
+                                StateAfter: Direct3D12::D3D12_RESOURCE_STATE_RESOLVE_DEST,
+                            },
+                        ),
+                    },
+                });
+            }
+            if !self.temp.barriers.is_empty() {
+                unsafe { list4.ResourceBarrier(&self.temp.barriers) };
+            }
+            unsafe { list4.EndRenderPass() };
+            for barrier in self.temp.barriers.iter_mut() {
+                let transition = unsafe { &mut *barrier.Anonymous.Transition };
+                mem::swap(&mut transition.StateBefore, &mut transition.StateAfter);
+            }
+            if !self.temp.barriers.is_empty() {
+                unsafe { list4.ResourceBarrier(&self.temp.barriers) };
+            }
+        } else if !self.pass.resolves.is_empty() {
             let list = self.list.as_ref().unwrap();
             self.temp.barriers.clear();
 

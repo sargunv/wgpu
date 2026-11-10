@@ -315,6 +315,46 @@ impl super::Adapter {
                     .as_bool()
         };
 
+        // Native render passes (`BeginRenderPass`) carry each attachment's
+        // load, store and resolve, so a tiling GPU (Adreno) can keep
+        // multisampled attachments on chip, resolve them there, and drop
+        // what a pass discards. `OMSetRenderTargets` can't say any of that.
+        // Like Dawn, use them where the runtime reports them valid
+        // (`OPTIONS18`, with the read-only depth and stencil flags);
+        // `WGPU_DX12_RENDER_PASSES=0` or `1` turns them off or on.
+        let render_passes = {
+            let mut features18 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS18::default();
+            let valid = unsafe {
+                device.CheckFeatureSupport(
+                    Direct3D12::D3D12_FEATURE_D3D12_OPTIONS18,
+                    <*mut _>::cast(&mut features18),
+                    size_of_val(&features18) as u32,
+                )
+            }
+            .is_ok()
+                && features18.RenderPassesValid.as_bool();
+            let mut features5 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
+            let _ = unsafe {
+                device.CheckFeatureSupport(
+                    Direct3D12::D3D12_FEATURE_D3D12_OPTIONS5,
+                    <*mut _>::cast(&mut features5),
+                    size_of_val(&features5) as u32,
+                )
+            };
+            let render_passes = match std::env::var("WGPU_DX12_RENDER_PASSES").as_deref() {
+                Ok("0") => false,
+                Ok("1") => true,
+                _ => valid,
+            };
+            log::info!(
+                "{}: render passes {} (RenderPassesValid {valid}, tier {})",
+                info.name,
+                if render_passes { "on" } else { "off" },
+                features5.RenderPassesTier.0,
+            );
+            render_passes
+        };
+
         let mut max_sampler_descriptor_heap_size =
             Direct3D12::D3D12_MAX_SHADER_VISIBLE_SAMPLER_HEAP_SIZE;
         {
@@ -454,6 +494,7 @@ impl super::Adapter {
             shader_model,
             max_sampler_descriptor_heap_size,
             unrestricted_buffer_texture_copy_pitch_supported,
+            render_passes,
         };
 
         // these should always be available on d3d12

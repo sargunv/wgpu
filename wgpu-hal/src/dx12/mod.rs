@@ -680,6 +680,9 @@ struct PrivateCapabilities {
     shader_model: naga::back::hlsl::ShaderModel,
     max_sampler_descriptor_heap_size: u32,
     unrestricted_buffer_texture_copy_pitch_supported: bool,
+    /// Whether render passes begin with `BeginRenderPass`, not
+    /// `OMSetRenderTargets` and clears.
+    render_passes: bool,
 }
 
 impl PrivateCapabilities {
@@ -756,6 +759,9 @@ struct DeviceShared {
     heap_views: descriptor::GeneralHeap,
     sampler_heap: sampler::SamplerHeap,
     private_caps: PrivateCapabilities,
+    /// Whether a pipeline layout lets a vertex or fragment shader write a
+    /// UAV, so render passes must allow UAV writes.
+    render_uav_writes: core::sync::atomic::AtomicBool,
 }
 
 unsafe impl Send for DeviceShared {}
@@ -944,6 +950,8 @@ struct PassState {
     vertex_buffers: [Direct3D12::D3D12_VERTEX_BUFFER_VIEW; crate::MAX_VERTEX_BUFFERS],
     dirty_vertex_buffers: usize,
     kind: PassKind,
+    /// The list a render pass begun with `BeginRenderPass` ends on.
+    render_pass: Option<Direct3D12::ID3D12GraphicsCommandList4>,
 }
 
 // `root_elements` size must match `dirty_root_elements` bit size
@@ -968,6 +976,7 @@ impl PassState {
             vertex_buffers: [Default::default(); crate::MAX_VERTEX_BUFFERS],
             dirty_vertex_buffers: 0,
             kind: PassKind::Transfer,
+            render_pass: None,
         }
     }
 
@@ -995,6 +1004,10 @@ pub struct CommandEncoder {
     free_lists: Vec<Direct3D12::ID3D12GraphicsCommandList>,
     pass: PassState,
     temp: Temp,
+    /// A render pass's resolve regions, which must stay put until its
+    /// `EndRenderPass`.
+    resolve_regions: [Direct3D12::D3D12_RENDER_PASS_ENDING_ACCESS_RESOLVE_SUBRESOURCE_PARAMETERS;
+        crate::MAX_COLOR_ATTACHMENTS],
 
     /// If set, the end of the next render/compute pass will write a timestamp at
     /// the given pool & location.
