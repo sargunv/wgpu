@@ -320,7 +320,8 @@ impl super::Adapter {
         // multisampled attachments on chip, resolve them there, and drop
         // what a pass discards. `OMSetRenderTargets` can't say any of that.
         // Like Dawn, use them where the runtime reports them valid
-        // (`OPTIONS18`, with the read-only depth and stencil flags);
+        // (`OPTIONS18`, with the read-only depth and stencil flags) and
+        // the driver isn't one Dawn knows to break them;
         // `WGPU_DX12_RENDER_PASSES=0` or `1` turns them off or on.
         let render_passes = {
             let mut features18 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS18::default();
@@ -333,6 +334,16 @@ impl super::Adapter {
             }
             .is_ok()
                 && features18.RenderPassesValid.as_bool();
+            // Intel's Arc Alchemist (Gen12 HP) and Xe-LPG drivers before
+            // 32.0.101.8247 don't clear a depth-stencil attachment from a
+            // beginning access's clear value (Dawn turns render passes off
+            // there, https://issues.chromium.org/issues/430338408).
+            // Intel's build number is the version's last two parts.
+            let buggy_intel_depth_clear = desc.VendorId == 0x8086
+                && matches!(desc.DeviceId & 0xFF00, 0x4F00 | 0x5600 | 0x7D00 | 0xB600)
+                && !driver_version
+                    .is_ok_and(|v| u32::from(v[2]) * 10000 + u32::from(v[3]) >= 101 * 10000 + 8247);
+            let valid = valid && !buggy_intel_depth_clear;
             let mut features5 = Direct3D12::D3D12_FEATURE_DATA_D3D12_OPTIONS5::default();
             let _ = unsafe {
                 device.CheckFeatureSupport(
