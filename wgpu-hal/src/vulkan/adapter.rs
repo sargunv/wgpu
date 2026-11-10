@@ -2438,9 +2438,15 @@ impl super::Instance {
                 .as_ref()
                 .map(|r| r.robust_image_access2 == 1)
                 .unwrap_or_default(),
+            // MoltenVK advertises the feature, but its SPIRV-Cross lowers a
+            // workgroup variable's initializer to a loop striding by
+            // `gl_WorkGroupSize`, which it never declares when the module
+            // sizes its workgroup by execution mode: the Metal library fails
+            // to compile. Naga's polyfill zeroes the memory instead.
             zero_initialize_workgroup_memory: phd_features
                 .zero_initialize_workgroup_memory
-                .is_some_and(|ext| ext.shader_zero_initialize_workgroup_memory == vk::TRUE),
+                .is_some_and(|ext| ext.shader_zero_initialize_workgroup_memory == vk::TRUE)
+                && !phd_capabilities.is_driver(vk::DriverId::MOLTENVK),
             image_format_list: phd_capabilities.device_api_version >= vk::API_VERSION_1_2
                 || phd_capabilities.supports_extension(khr::image_format_list::NAME),
             maximum_samplers: phd_capabilities

@@ -17,14 +17,7 @@ static RESTRICT_WORKGROUP_PRIVATE_FUNCTION_LET: GpuTestConfiguration = GpuTestCo
         TestParameters::default()
             .downlevel_flags(wgpu::DownlevelFlags::COMPUTE_SHADERS)
             .limits(wgpu::Limits::downlevel_defaults())
-            .skip(FailureCase::backend(Backends::GL))
-            // https://github.com/gfx-rs/wgpu/issues/9184
-            .expect_fail(
-                FailureCase::molten_vk()
-                    .validation_error("Shader library compile failed")
-                    .validation_error("could not be compiled into pipeline")
-                    .unexpected_error("Unexpected Vulkan error: ERROR_INITIALIZATION_FAILED"),
-            ),
+            .skip(FailureCase::backend(Backends::GL)),
     )
     .run_async(|ctx| async move {
         let test_resources = TestResources::new(&ctx);
