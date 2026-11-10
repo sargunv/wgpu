@@ -232,12 +232,14 @@ impl super::CommandEncoder {
     fn set_pipeline_inner(&mut self, inner: &super::PipelineInner) {
         self.cmd_buffer.commands.push(C::SetProgram(inner.program));
 
+        let linked = inner.linked.lock();
         self.state
             .first_instance_location
-            .clone_from(&inner.first_instance_location);
+            .clone_from(&linked.first_instance_location);
         self.state
             .immediates_descs
-            .clone_from(&inner.immediates_descs);
+            .clone_from(&linked.immediates_descs);
+        drop(linked);
 
         // rebind textures, if needed
         let mut dirty_textures = 0u32;

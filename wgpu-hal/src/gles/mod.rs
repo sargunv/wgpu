@@ -296,6 +296,12 @@ struct AdapterShared {
     next_shader_id: AtomicU32,
     program_cache: Mutex<ProgramCache>,
     es: bool,
+    /// `KHR_parallel_shader_compile`: programs link in the background, and
+    /// `COMPLETION_STATUS_KHR` says when they finished.
+    parallel_compile: bool,
+    /// Render pipelines leave their link to [`Device::poll_link`]
+    /// ([`Device::defer_links`]).
+    defer_links: core::sync::atomic::AtomicBool,
 
     /// Result of `gl.get_parameter_i32(glow::MAX_SAMPLES)`.
     /// Cached here so it doesn't need to be queried every time texture format capabilities are requested.
@@ -316,6 +322,8 @@ impl fmt::Debug for AdapterShared {
             next_shader_id,
             program_cache: _,
             es,
+            parallel_compile,
+            defer_links,
             max_msaa_samples,
         } = self;
         f.debug_struct("AdapterShared")
@@ -327,6 +335,8 @@ impl fmt::Debug for AdapterShared {
             .field("shading_language_version", shading_language_version)
             .field("next_shader_id", next_shader_id)
             .field("es", es)
+            .field("parallel_compile", parallel_compile)
+            .field("defer_links", defer_links)
             .field("max_msaa_samples", max_msaa_samples)
             .finish_non_exhaustive()
     }
@@ -741,9 +751,23 @@ type SamplerBindMap = [Option<u8>; MAX_TEXTURE_SLOTS];
 struct PipelineInner {
     program: glow::Program,
     sampler_map: SamplerBindMap,
+    clip_distance_count: u32,
+    /// What the linked program gives. A link [`Device::defer_links`]
+    /// deferred is read by [`Device::poll_link`] once it finished; until
+    /// then this is empty.
+    linked: Mutex<Linked>,
+    /// A deferred link not read yet.
+    deferred: Mutex<Option<device::DeferredLink>>,
+}
+
+/// What a program gives once it linked.
+#[derive(Clone, Debug, Default)]
+struct Linked {
     first_instance_location: Option<glow::UniformLocation>,
     immediates_descs: ArrayVec<ImmediateDesc, MAX_IMMEDIATES_COMMANDS>,
-    clip_distance_count: u32,
+    /// Why it failed to link, if it did (a deferred link: one that isn't
+    /// fails pipeline creation).
+    error: Option<String>,
 }
 
 #[cfg(send_sync)]

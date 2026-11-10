@@ -12,6 +12,7 @@ use core::{cmp::max, convert::TryInto, num::NonZeroU32, ptr, sync::atomic::Order
 use arrayvec::ArrayVec;
 use glow::HasContext;
 use naga::FastHashMap;
+use parking_lot::Mutex;
 
 use super::{conv, lock, MaybeMutex, PrivateCapabilities};
 use crate::auxil::map_naga_stage;
@@ -247,6 +248,7 @@ impl super::Device {
         shader: &str,
         naga_stage: naga::ShaderStage,
         #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
+        check: bool,
     ) -> Result<glow::Shader, crate::PipelineError> {
         let target = match naga_stage {
             naga::ShaderStage::Vertex => glow::VERTEX_SHADER,
@@ -272,6 +274,12 @@ impl super::Device {
 
         log::debug!("\tCompiled shader {raw:?}");
 
+        // A deferred link reads the status once the program linked: reading
+        // it now would wait for the compile.
+        if !check {
+            return Ok(raw);
+        }
+
         let compiled_ok = unsafe { gl.get_shader_compile_status(raw) };
         let msg = unsafe { gl.get_shader_info_log(raw) };
         if compiled_ok {
@@ -295,6 +303,7 @@ impl super::Device {
         stage: &crate::ProgrammableStage<super::ShaderModule>,
         context: CompilationContext,
         program: glow::Program,
+        check: bool,
     ) -> Result<glow::Shader, crate::PipelineError> {
         let source = 'outer: {
             use naga::back::glsl;
@@ -392,7 +401,15 @@ impl super::Device {
             Cow::Owned(output)
         };
 
-        unsafe { Self::compile_shader(gl, &source, naga_stage, stage.module.label.as_deref()) }
+        unsafe {
+            Self::compile_shader(
+                gl,
+                &source,
+                naga_stage,
+                stage.module.label.as_deref(),
+                check,
+            )
+        }
     }
 
     unsafe fn create_pipeline<'a>(
@@ -402,6 +419,7 @@ impl super::Device {
         layout: &super::PipelineLayout,
         #[cfg_attr(target_arch = "wasm32", allow(unused))] label: Option<&str>,
         multiview_mask: Option<NonZeroU32>,
+        defer: bool,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let mut program_stages = ArrayVec::new();
         let group_to_binding_to_slot = layout
@@ -439,6 +457,7 @@ impl super::Device {
                     multiview_mask,
                     self.shared.shading_language_version,
                     self.shared.private_caps,
+                    defer,
                 )
             })
             .to_owned()?;
@@ -458,6 +477,7 @@ impl super::Device {
         buf
     }
 
+    #[allow(clippy::too_many_arguments)]
     unsafe fn create_program<'a>(
         gl: &glow::Context,
         shaders: ArrayVec<ShaderStage<'a>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
@@ -466,6 +486,7 @@ impl super::Device {
         multiview_mask: Option<NonZeroU32>,
         glsl_version: naga::back::glsl::Version,
         private_caps: PrivateCapabilities,
+        defer: bool,
     ) -> Result<Arc<super::PipelineInner>, crate::PipelineError> {
         let glsl_version = match glsl_version {
             naga::back::glsl::Version::Embedded { version, .. } => format!("{version} es"),
@@ -502,8 +523,8 @@ impl super::Device {
                 clip_distance_count: &mut clip_distance_count,
             };
 
-            let shader = Self::create_shader(gl, naga_stage, stage, context, program)?;
-            shaders_to_delete.push(shader);
+            let shader = Self::create_shader(gl, naga_stage, stage, context, program, !defer)?;
+            shaders_to_delete.push((naga_stage, shader));
         }
 
         // Create empty fragment shader if only vertex shader is present
@@ -516,26 +537,78 @@ impl super::Device {
                     &shader_src,
                     naga::ShaderStage::Fragment,
                     Some("(wgpu internal) dummy fragment shader"),
+                    !defer,
                 )
             }?;
-            shaders_to_delete.push(shader);
+            shaders_to_delete.push((naga::ShaderStage::Fragment, shader));
         }
 
-        for &shader in shaders_to_delete.iter() {
+        for &(_, shader) in shaders_to_delete.iter() {
             unsafe { gl.attach_shader(program, shader) };
         }
         unsafe { gl.link_program(program) };
 
-        for shader in shaders_to_delete {
-            unsafe { gl.delete_shader(shader) };
-        }
-
         log::debug!("\tLinked program {program:?}");
 
+        let link = DeferredLink {
+            has_stages,
+            shaders: shaders_to_delete,
+            name_binding_map,
+            immediates_items,
+        };
+        let (linked, deferred) = if defer {
+            (super::Linked::default(), Some(link))
+        } else {
+            match unsafe { Self::read_link(gl, program, link, private_caps) } {
+                Ok(linked) => (linked, None),
+                Err(e) => {
+                    unsafe { gl.delete_program(program) };
+                    return Err(e);
+                }
+            }
+        };
+
+        Ok(Arc::new(super::PipelineInner {
+            program,
+            sampler_map,
+            clip_distance_count,
+            linked: Mutex::new(linked),
+            deferred: Mutex::new(deferred),
+        }))
+    }
+
+    /// Reads what a linked program gives, waiting for its link if it
+    /// hasn't finished, and lets its shaders go.
+    unsafe fn read_link(
+        gl: &glow::Context,
+        program: glow::Program,
+        link: DeferredLink,
+        private_caps: PrivateCapabilities,
+    ) -> Result<super::Linked, crate::PipelineError> {
+        let DeferredLink {
+            has_stages,
+            shaders,
+            name_binding_map,
+            immediates_items,
+        } = link;
         let linked_ok = unsafe { gl.get_program_link_status(program) };
         let msg = unsafe { gl.get_program_info_log(program) };
+        // A shader that failed to compile says why (its status unread if
+        // the link was deferred).
+        let mut failed = None;
+        for (naga_stage, shader) in shaders {
+            if !linked_ok && failed.is_none() && !unsafe { gl.get_shader_compile_status(shader) } {
+                let log = unsafe { gl.get_shader_info_log(shader) };
+                log::error!("\tShader compilation failed: {log}");
+                failed = Some(crate::PipelineError::Linkage(
+                    map_naga_stage(naga_stage),
+                    log,
+                ));
+            }
+            unsafe { gl.delete_shader(shader) };
+        }
         if !linked_ok {
-            return Err(crate::PipelineError::Linkage(has_stages, msg));
+            return Err(failed.unwrap_or(crate::PipelineError::Linkage(has_stages, msg)));
         }
         if !msg.is_empty() {
             log::debug!("\tLink message: {msg}");
@@ -599,13 +672,68 @@ impl super::Device {
             None
         };
 
-        Ok(Arc::new(super::PipelineInner {
-            program,
-            sampler_map,
+        Ok(super::Linked {
             first_instance_location,
             immediates_descs: uniforms,
-            clip_distance_count,
-        }))
+            error: None,
+        })
+    }
+
+    /// Defers the links of later render pipelines, where programs link in
+    /// the background (`KHR_parallel_shader_compile`): their creation
+    /// returns without waiting for the driver, and [`Self::poll_link`]
+    /// says when each finished. A deferred pipeline must not be used
+    /// before `poll_link` returns `Some`. Returns whether links are
+    /// deferred.
+    pub fn defer_links(&self, on: bool) -> bool {
+        let on = on && self.shared.parallel_compile;
+        self.shared.defer_links.store(on, Ordering::Relaxed);
+        on
+    }
+
+    /// `None` while `pipeline`'s deferred link runs, then whether it
+    /// linked (the error message if not); `Some(Ok(()))` for a pipeline
+    /// whose link wasn't deferred. The call that finds the link finished
+    /// reads what the program gives.
+    ///
+    /// # Safety
+    ///
+    /// `pipeline` must be this device's.
+    pub unsafe fn poll_link(&self, pipeline: &super::RenderPipeline) -> Option<Result<(), String>> {
+        let inner = &pipeline.inner;
+        let mut deferred = inner.deferred.lock();
+        if let Some(link) = deferred.take() {
+            let gl = &self.shared.context.lock();
+            if !unsafe { gl.get_program_completion_status(inner.program) } {
+                *deferred = Some(link);
+                return None;
+            }
+            let read =
+                unsafe { Self::read_link(gl, inner.program, link, self.shared.private_caps) };
+            *inner.linked.lock() = read.unwrap_or_else(|e| super::Linked {
+                error: Some(e.to_string()),
+                ..Default::default()
+            });
+        }
+        Some(match &inner.linked.lock().error {
+            Some(e) => Err(e.clone()),
+            None => Ok(()),
+        })
+    }
+}
+
+/// What reading a program's link needs.
+pub(super) struct DeferredLink {
+    has_stages: wgt::ShaderStages,
+    shaders: ArrayVec<(naga::ShaderStage, glow::Shader), { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+    name_binding_map: NameBindingMap,
+    immediates_items:
+        ArrayVec<Vec<naga::back::glsl::ImmediateItem>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
+}
+
+impl core::fmt::Debug for DeferredLink {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("DeferredLink").finish_non_exhaustive()
     }
 }
 
@@ -1526,7 +1654,14 @@ impl crate::Device for super::Device {
             shaders.push((naga::ShaderStage::Fragment, fs));
         }
         let inner = unsafe {
-            self.create_pipeline(gl, shaders, desc.layout, desc.label, desc.multiview_mask)
+            self.create_pipeline(
+                gl,
+                shaders,
+                desc.layout,
+                desc.label,
+                desc.multiview_mask,
+                self.shared.defer_links.load(Ordering::Relaxed),
+            )
         }?;
 
         let (vertex_buffers, vertex_attributes) = {
@@ -1622,7 +1757,8 @@ impl crate::Device for super::Device {
         let gl = &self.shared.context.lock();
         let mut shaders = ArrayVec::new();
         shaders.push((naga::ShaderStage::Compute, &desc.stage));
-        let inner = unsafe { self.create_pipeline(gl, shaders, desc.layout, desc.label, None) }?;
+        let inner =
+            unsafe { self.create_pipeline(gl, shaders, desc.layout, desc.label, None, false) }?;
 
         self.counters.compute_pipelines.add(1);
 

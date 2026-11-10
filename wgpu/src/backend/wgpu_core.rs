@@ -223,6 +223,13 @@ impl ContextWgpuCore {
         unsafe { self.0.texture_as_hal::<A>(texture.id) }
     }
 
+    pub unsafe fn render_pipeline_as_hal<A: hal::Api>(
+        &self,
+        pipeline: &CoreRenderPipeline,
+    ) -> Option<impl Deref<Target = A::RenderPipeline>> {
+        unsafe { self.0.render_pipeline_as_hal::<A>(pipeline.id) }
+    }
+
     pub unsafe fn texture_view_as_hal<A: hal::Api>(
         &self,
         texture_view: &CoreTextureView,

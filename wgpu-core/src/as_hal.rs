@@ -6,8 +6,8 @@ use hal::DynResource;
 use crate::{
     global::Global,
     id::{
-        AdapterId, BlasId, BufferId, CommandEncoderId, DeviceId, QueueId, SurfaceId, TextureId,
-        TextureViewId, TlasId,
+        AdapterId, BlasId, BufferId, CommandEncoderId, DeviceId, QueueId, RenderPipelineId,
+        SurfaceId, TextureId, TextureViewId, TlasId,
     },
     lock::RankData,
     resource::RawResourceAccess,
@@ -200,6 +200,22 @@ impl Global {
         let view = hub.texture_views.get(id).get().ok()?;
 
         SnatchableResourceGuard::new(view)
+    }
+
+    /// # Safety
+    ///
+    /// - The raw render pipeline handle must not be manually destroyed
+    pub unsafe fn render_pipeline_as_hal<A: hal::Api>(
+        &self,
+        id: RenderPipelineId,
+    ) -> Option<impl Deref<Target = A::RenderPipeline>> {
+        profiling::scope!("RenderPipeline::as_hal");
+
+        let pipeline = self.hub.render_pipelines.get(id);
+
+        SimpleResourceGuard::new(pipeline, move |pipeline| {
+            pipeline.raw().ok()?.as_any().downcast_ref()
+        })
     }
 
     /// # Safety

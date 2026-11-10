@@ -29,6 +29,23 @@ impl RenderPipeline {
         BindGroupLayout { inner: layout }
     }
 
+    /// Returns the inner hal RenderPipeline using a callback. The hal pipeline will be `None` if the
+    /// backend type argument does not match with this wgpu RenderPipeline.
+    ///
+    /// # Safety
+    ///
+    /// - The returned resource must not be destroyed unless the guard
+    ///   is the last reference to it and it is not in use by the GPU.
+    ///   The guard and handle may be dropped at any time however.
+    /// - All the safety requirements of wgpu-hal must be upheld.
+    #[cfg(wgpu_core)]
+    pub unsafe fn as_hal<A: hal::Api>(
+        &self,
+    ) -> Option<impl core::ops::Deref<Target = A::RenderPipeline>> {
+        let pipeline = self.inner.as_core_opt()?;
+        unsafe { pipeline.context.render_pipeline_as_hal::<A>(pipeline) }
+    }
+
     #[cfg(custom)]
     /// Returns custom implementation of RenderPipeline (if custom backend and is internally T)
     pub fn as_custom<T: custom::RenderPipelineInterface>(&self) -> Option<&T> {

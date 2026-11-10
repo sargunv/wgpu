@@ -937,6 +937,8 @@ impl super::Adapter {
 
         let downlevel_defaults = wgt::DownlevelLimits {};
         let max_samples = unsafe { gl.get_parameter_i32(glow::MAX_SAMPLES) };
+        let parallel_compile = extensions.contains("GL_KHR_parallel_shader_compile")
+            || extensions.contains("KHR_parallel_shader_compile");
 
         // Drop the GL guard so we can move the context into AdapterShared
         // ( on Wasm the gl handle is just a ref so we tell clippy to allow
@@ -957,6 +959,8 @@ impl super::Adapter {
                     next_shader_id: Default::default(),
                     program_cache: Default::default(),
                     es: es_ver.is_some(),
+                    parallel_compile,
+                    defer_links: Default::default(),
                     max_msaa_samples: max_samples,
                 }),
             },
