@@ -160,6 +160,7 @@ dx12 = [
     "windows/Win32_Graphics_Dxgi_Common",
     "windows/Win32_Graphics_Gdi",
     "windows/Win32_Security",
+    "windows/Win32_Security_Cryptography",
     "windows/Win32_System_Diagnostics_Debug",
     "windows/Win32_System_Kernel",
     "windows/Win32_System_Performance",

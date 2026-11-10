@@ -286,6 +286,7 @@ impl super::Device {
         layout: &super::PipelineLayout,
         naga_stage: naga::ShaderStage,
         fragment_stage: Option<&crate::ProgrammableStage<super::ShaderModule>>,
+        cache: Option<&super::PipelineCache>,
     ) -> Result<super::CompiledShader, crate::PipelineError> {
         let stage_bit = auxil::map_naga_stage(naga_stage);
 
@@ -432,6 +433,7 @@ impl super::Device {
             &key.entry_point,
             stage_bit,
             &full_stage,
+            cache,
         )?;
 
         {
@@ -1979,7 +1981,13 @@ impl crate::Device for super::Device {
         let blob_fs = match desc.fragment_stage {
             Some(ref stage) => {
                 shader_stages |= wgt::ShaderStages::FRAGMENT;
-                Some(self.load_shader(stage, desc.layout, naga::ShaderStage::Fragment, None)?)
+                Some(self.load_shader(
+                    stage,
+                    desc.layout,
+                    naga::ShaderStage::Fragment,
+                    None,
+                    desc.cache,
+                )?)
             }
             None => None,
         };
@@ -2092,6 +2100,7 @@ impl crate::Device for super::Device {
                     desc.layout,
                     naga::ShaderStage::Vertex,
                     desc.fragment_stage.as_ref(),
+                    desc.cache,
                 )?);
 
                 for (i, (stride, vbuf)) in vertex_strides.iter_mut().zip(vertex_buffers).enumerate()
@@ -2157,6 +2166,7 @@ impl crate::Device for super::Device {
                         desc.layout,
                         naga::ShaderStage::Task,
                         desc.fragment_stage.as_ref(),
+                        desc.cache,
                     )?)
                 } else {
                     None
@@ -2172,6 +2182,7 @@ impl crate::Device for super::Device {
                     desc.layout,
                     naga::ShaderStage::Mesh,
                     desc.fragment_stage.as_ref(),
+                    desc.cache,
                 )?);
                 stream_desc.task_shader = task_shader;
                 stream_desc.mesh_shader = blob_ms.as_ref().unwrap().create_native_shader();
@@ -2224,8 +2235,13 @@ impl crate::Device for super::Device {
             super::PipelineCache,
         >,
     ) -> Result<super::ComputePipeline, crate::PipelineError> {
-        let blob_cs =
-            self.load_shader(&desc.stage, desc.layout, naga::ShaderStage::Compute, None)?;
+        let blob_cs = self.load_shader(
+            &desc.stage,
+            desc.layout,
+            naga::ShaderStage::Compute,
+            None,
+            desc.cache,
+        )?;
 
         let pair = {
             profiling::scope!("ID3D12Device::CreateComputePipelineState");
@@ -2289,9 +2305,15 @@ impl crate::Device for super::Device {
 
     unsafe fn create_pipeline_cache(
         &self,
-        _desc: &crate::PipelineCacheDescriptor<'_>,
+        desc: &crate::PipelineCacheDescriptor<'_>,
     ) -> Result<super::PipelineCache, crate::PipelineCacheError> {
-        Ok(super::PipelineCache)
+        Ok(super::PipelineCache::new(desc.data))
+    }
+    fn pipeline_cache_validation_key(&self) -> Option<[u8; 16]> {
+        // Bytecode from another compiler is outdated, not wrong, but its
+        // entries would never be found again.
+        let key = super::pipeline_cache::key([self.compiler_container.identity().as_bytes()])?;
+        key[..16].try_into().ok()
     }
     unsafe fn destroy_pipeline_cache(&self, _: super::PipelineCache) {}
 
@@ -2477,6 +2499,10 @@ impl crate::Device for super::Device {
             self.render_doc
                 .end_frame_capture(self.raw.as_raw(), ptr::null_mut())
         }
+    }
+
+    unsafe fn pipeline_cache_get_data(&self, cache: &super::PipelineCache) -> Option<Vec<u8>> {
+        Some(cache.data())
     }
 
     unsafe fn get_acceleration_structure_build_sizes<'a>(

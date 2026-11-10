@@ -1164,9 +1164,9 @@ bitflags_array! {
         ///
         /// Supported platforms:
         /// - Vulkan
+        /// - DX12 (the shader compiler's output: DXIL or DXBC)
         ///
         /// Unimplemented Platforms:
-        /// - DX12
         /// - Metal
         #[name("wgpu-pipeline-cache")]
         const PIPELINE_CACHE = 1 << 41;

@@ -170,6 +170,12 @@ pub fn pipeline_cache_key(adapter_info: &wgt::AdapterInfo) -> Option<String> {
             "wgpu_pipeline_cache_vulkan_{}_{}",
             adapter_info.vendor, adapter_info.device
         )),
+        // The shader compiler's output, which the device checks is
+        // from the same compiler.
+        wgt::Backend::Dx12 => Some(format!(
+            "wgpu_pipeline_cache_dx12_{}_{}",
+            adapter_info.vendor, adapter_info.device
+        )),
         _ => None,
     }
 }

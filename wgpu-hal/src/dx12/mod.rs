@@ -85,6 +85,7 @@ mod descriptor;
 mod device;
 mod device_creation;
 mod instance;
+mod pipeline_cache;
 mod pipeline_desc;
 mod sampler;
 mod shader_compilation;
@@ -113,6 +114,7 @@ use windows::{
 };
 
 use self::dcomp::DCompLib;
+pub use self::pipeline_cache::PipelineCache;
 use crate::auxil::{
     self,
     dxgi::{
@@ -1363,6 +1365,8 @@ pub(super) enum CompiledShader {
     Dxc(Direct3D::Dxc::IDxcBlob),
     Fxc(Direct3D::ID3DBlob),
     Precompiled(Vec<u8>),
+    /// From a [`PipelineCache`].
+    Cached(Arc<[u8]>),
 }
 
 impl CompiledShader {
@@ -1377,6 +1381,10 @@ impl CompiledShader {
                 BytecodeLength: unsafe { shader.GetBufferSize() },
             },
             CompiledShader::Precompiled(shader) => Direct3D12::D3D12_SHADER_BYTECODE {
+                pShaderBytecode: shader.as_ptr().cast(),
+                BytecodeLength: shader.len(),
+            },
+            CompiledShader::Cached(shader) => Direct3D12::D3D12_SHADER_BYTECODE {
                 pShaderBytecode: shader.as_ptr().cast(),
                 BytecodeLength: shader.len(),
             },
@@ -1412,11 +1420,6 @@ unsafe impl Sync for ComputePipeline {}
 pub struct RayTracingPipeline {}
 
 impl crate::DynRayTracingPipeline for RayTracingPipeline {}
-
-#[derive(Debug)]
-pub struct PipelineCache;
-
-impl crate::DynPipelineCache for PipelineCache {}
 
 #[derive(Debug)]
 pub struct AccelerationStructure {

@@ -23,6 +23,8 @@ pub(super) struct CompilerFxc {
 pub(super) struct CompilerDynamicDxc {
     max_shader_model: wgt::DxcShaderModel,
     compiler: Dxc::IDxcCompiler3,
+    /// Its version and commit, for pipeline cache keys.
+    identity: String,
     // Has to be held onto for the lifetime of the device otherwise shaders will fail to compile.
     // Only needed when using dynamic linking.
     _dxc: DxcLib,
@@ -31,6 +33,36 @@ pub(super) struct CompilerDynamicDxc {
 pub(super) struct CompilerStaticDxc {
     max_shader_model: wgt::DxcShaderModel,
     compiler: Dxc::IDxcCompiler3,
+    identity: String,
+}
+
+/// FXC's identity in pipeline cache keys: `d3dcompiler_47.dll` is frozen.
+const FXC_IDENTITY: &str = "FXC d3dcompiler_47";
+
+/// DXC's version, and what identifies its build in pipeline cache keys:
+/// the version and, where it says, its commit.
+fn dxc_version(compiler: &Dxc::IDxcCompiler3) -> (u32, u32, String) {
+    let (mut major, mut minor) = (1, 0);
+    // DXC 1.0 didn't support this. If the cast fails assume it is DXC 1.0.
+    if let Ok(version_info) = compiler.cast::<Dxc::IDxcVersionInfo>() {
+        unsafe {
+            version_info.GetVersion(&mut major, &mut minor).unwrap();
+        }
+    }
+    let mut identity = format!("DXC {major}.{minor}");
+    if let Ok(info) = compiler.cast::<Dxc::IDxcVersionInfo2>() {
+        let mut count = 0;
+        let mut hash: *mut i8 = core::ptr::null_mut();
+        if unsafe { info.GetCommitInfo(&mut count, &mut hash) }.is_ok() && !hash.is_null() {
+            let commit = unsafe { CStr::from_ptr(hash) };
+            identity = format!("{identity} {count} {}", commit.to_string_lossy());
+            windows_core::link!("ole32.dll" "system" fn CoTaskMemFree(pv: *const core::ffi::c_void));
+            // SAFETY: DXC allocates the commit's string with `CoTaskMemAlloc`
+            // for the caller to free.
+            unsafe { CoTaskMemFree(hash.cast()) };
+        }
+    }
+    (major, minor, identity)
 }
 
 #[derive(Debug, Error)]
@@ -51,18 +83,12 @@ impl CompilerContainer {
             .map_err(|e| GetContainerError::FailedToLoad("dxcompiler.dll", e))?;
 
         let compiler = dxc.create_instance::<Dxc::IDxcCompiler3>()?;
-
-        let (mut major, mut minor) = (1, 0);
-        // DXC 1.0 didn't support this. If the cast fails assume it is DXC 1.0.
-        if let Ok(version_info) = compiler.cast::<Dxc::IDxcVersionInfo>() {
-            unsafe {
-                version_info.GetVersion(&mut major, &mut minor).unwrap();
-            }
-        }
+        let (major, minor, identity) = dxc_version(&compiler);
 
         Ok(Self::DynamicDxc(CompilerDynamicDxc {
             max_shader_model: wgt::DxcShaderModel::from_dxc_version(major, minor),
             compiler,
+            identity,
             _dxc: dxc,
         }))
     }
@@ -80,9 +106,11 @@ impl CompilerContainer {
                     ))
                 })?;
 
+                let (_, _, identity) = dxc_version(&compiler);
                 Ok(CompilerContainer::StaticDxc(CompilerStaticDxc {
                     max_shader_model: wgt::DxcShaderModel::V6_7,
                     compiler,
+                    identity,
                 }))
             }
         }
@@ -104,6 +132,19 @@ impl CompilerContainer {
         }
     }
 
+    /// Which compiler this is, for pipeline cache keys: its data is
+    /// outdated when this changes.
+    pub(super) fn identity(&self) -> &str {
+        match self {
+            CompilerContainer::Fxc(..) => FXC_IDENTITY,
+            CompilerContainer::DynamicDxc(CompilerDynamicDxc { identity, .. })
+            | CompilerContainer::StaticDxc(CompilerStaticDxc { identity, .. }) => identity,
+        }
+    }
+
+    /// Compiles `source`, or takes its bytecode from `cache`, which keeps
+    /// what this compiles.
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn compile(
         &self,
         device: &super::Device,
@@ -112,6 +153,7 @@ impl CompilerContainer {
         raw_ep: &str,
         stage_bit: wgt::ShaderStages,
         full_stage: &str,
+        cache: Option<&super::PipelineCache>,
     ) -> Result<super::CompiledShader, crate::PipelineError> {
         match self {
             CompilerContainer::Fxc(CompilerFxc { fxc }) => compile_fxc(
@@ -122,9 +164,14 @@ impl CompilerContainer {
                 stage_bit,
                 full_stage,
                 fxc,
+                cache,
             ),
-            CompilerContainer::DynamicDxc(CompilerDynamicDxc { compiler, .. })
-            | CompilerContainer::StaticDxc(CompilerStaticDxc { compiler, .. }) => compile_dxc(
+            CompilerContainer::DynamicDxc(CompilerDynamicDxc {
+                compiler, identity, ..
+            })
+            | CompilerContainer::StaticDxc(CompilerStaticDxc {
+                compiler, identity, ..
+            }) => compile_dxc(
                 device,
                 source,
                 source_name,
@@ -132,6 +179,8 @@ impl CompilerContainer {
                 stage_bit,
                 full_stage,
                 compiler,
+                identity,
+                cache,
             ),
         }
     }
@@ -219,6 +268,7 @@ impl FxcLib {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_fxc(
     device: &super::Device,
     source: &str,
@@ -227,6 +277,7 @@ fn compile_fxc(
     stage_bit: wgt::ShaderStages,
     full_stage: &str,
     fxc: &FxcLib,
+    cache: Option<&super::PipelineCache>,
 ) -> Result<super::CompiledShader, crate::PipelineError> {
     profiling::scope!("compile_fxc");
     let mut compile_flags = Fxc::D3DCOMPILE_ENABLE_STRICTNESS;
@@ -237,6 +288,23 @@ fn compile_fxc(
         .contains(wgt::InstanceFlags::DEBUG)
     {
         compile_flags |= Fxc::D3DCOMPILE_DEBUG | Fxc::D3DCOMPILE_SKIP_OPTIMIZATION;
+    }
+
+    let flags = compile_flags.to_le_bytes();
+    let key = cache.and_then(|_| {
+        super::pipeline_cache::key([
+            FXC_IDENTITY.as_bytes(),
+            source_name.map_or(&[][..], CStr::to_bytes),
+            raw_ep.as_bytes(),
+            full_stage.as_bytes(),
+            &flags[..],
+            source.as_bytes(),
+        ])
+    });
+    if let (Some(cache), Some(key)) = (cache, &key) {
+        if let Some(bytecode) = cache.get(key) {
+            return Ok(super::CompiledShader::Cached(bytecode));
+        }
     }
 
     let mut shader_data = None;
@@ -254,6 +322,14 @@ fn compile_fxc(
     match hr {
         Ok(()) => {
             let shader_data = shader_data.unwrap();
+            if let (Some(cache), Some(key)) = (cache, key) {
+                cache.insert(key, unsafe {
+                    core::slice::from_raw_parts(
+                        shader_data.GetBufferPointer().cast(),
+                        shader_data.GetBufferSize(),
+                    )
+                });
+            }
             Ok(super::CompiledShader::Fxc(shader_data))
         }
         Err(e) => {
@@ -362,6 +438,7 @@ fn as_err_str(blob: &Dxc::IDxcBlobUtf8) -> Result<&str, crate::DeviceError> {
         .map_err(|_| crate::DeviceError::Unexpected)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn compile_dxc(
     device: &crate::dx12::Device,
     source: &str,
@@ -370,6 +447,8 @@ fn compile_dxc(
     stage_bit: wgt::ShaderStages,
     full_stage: &str,
     compiler: &Dxc::IDxcCompiler3,
+    identity: &str,
+    cache: Option<&super::PipelineCache>,
 ) -> Result<crate::dx12::CompiledShader, crate::PipelineError> {
     profiling::scope!("compile_dxc");
 
@@ -418,6 +497,31 @@ fn compile_dxc(
         compile_args.push(windows::core::w!("-enable-16bit-types"));
     }
 
+    // Keyed by every argument the compile takes, as the compiler reads them.
+    let key = cache.and_then(|_| {
+        let args: Vec<Vec<u8>> = compile_args
+            .iter()
+            .map(|arg| {
+                // SAFETY: each argument is a NUL-terminated wide string that
+                // outlives `compile_args`.
+                unsafe { arg.as_wide() }
+                    .iter()
+                    .flat_map(|c| c.to_le_bytes())
+                    .collect()
+            })
+            .collect();
+        super::pipeline_cache::key(
+            core::iter::once(identity.as_bytes())
+                .chain(args.iter().map(Vec::as_slice))
+                .chain([source.as_bytes()]),
+        )
+    });
+    if let (Some(cache), Some(key)) = (cache, &key) {
+        if let Some(bytecode) = cache.get(key) {
+            return Ok(crate::dx12::CompiledShader::Cached(bytecode));
+        }
+    }
+
     let buffer = Dxc::DxcBuffer {
         Ptr: source.as_ptr().cast(),
         Size: source.len(),
@@ -445,6 +549,12 @@ fn compile_dxc(
     }
 
     let blob = get_output::<Dxc::IDxcBlob>(&compile_res, Dxc::DXC_OUT_OBJECT)?;
+
+    if let (Some(cache), Some(key)) = (cache, key) {
+        cache.insert(key, unsafe {
+            core::slice::from_raw_parts(blob.GetBufferPointer().cast(), blob.GetBufferSize())
+        });
+    }
 
     Ok(crate::dx12::CompiledShader::Dxc(blob))
 }
