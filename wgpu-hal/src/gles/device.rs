@@ -24,6 +24,7 @@ type ShaderStage<'a> = (
 );
 type NameBindingMap = FastHashMap<String, (super::BindingRegister, u8)>;
 
+#[cfg_attr(not(feature = "gles-naga"), allow(dead_code))]
 struct CompilationContext<'a> {
     layout: &'a super::PipelineLayout,
     sampler_map: &'a mut super::SamplerBindMap,
@@ -34,6 +35,68 @@ struct CompilationContext<'a> {
 }
 
 impl CompilationContext<'_> {
+    /// Takes a passthrough stage's bindings from its binding lines: GLSL
+    /// ES 3.00 can't say which binding a uniform block or texture is, so
+    /// the source names them in comments, a line each, at the WGSL group
+    /// and binding the pipeline layout gives them:
+    ///
+    /// ```glsl
+    /// //@block <block name> <group> <binding>
+    /// //@texture <sampler uniform name> <group> <binding> [<sampler group> <sampler binding>]
+    /// ```
+    ///
+    /// The program binds each by name once linked, as it does a naga
+    /// module's where the context can't take `layout(binding = …)`.
+    fn consume_binding_lines(
+        self,
+        source: &str,
+        naga_stage: naga::ShaderStage,
+    ) -> Result<(), crate::PipelineError> {
+        let bad = |line: &str| {
+            crate::PipelineError::Linkage(
+                map_naga_stage(naga_stage),
+                format!("binding line `{line}` names no binding of the layout"),
+            )
+        };
+        for line in source.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("//@") else {
+                continue;
+            };
+            let mut words = rest.split_ascii_whitespace();
+            let (Some(kind), Some(name)) = (words.next(), words.next()) else {
+                return Err(bad(line));
+            };
+            let numbers = words
+                .map(|w| w.parse::<u32>())
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|_| bad(line))?;
+            let slot = |group: u32, binding: u32| {
+                let info = self.layout.group_infos.get(group as usize)?.as_ref()?;
+                let slot = *info.binding_to_slot.get(binding as usize)?;
+                (slot != !0).then_some(slot)
+            };
+            match (kind, numbers.as_slice()) {
+                ("block", &[group, binding]) => {
+                    let slot = slot(group, binding).ok_or_else(|| bad(line))?;
+                    (self.name_binding_map)
+                        .insert(name.into(), (super::BindingRegister::UniformBuffers, slot));
+                }
+                ("texture", &[group, binding, ref sampler @ ..]) if sampler.len() != 1 => {
+                    let texture = slot(group, binding).ok_or_else(|| bad(line))?;
+                    (self.name_binding_map)
+                        .insert(name.into(), (super::BindingRegister::Textures, texture));
+                    if let [group, binding] = *sampler {
+                        self.sampler_map[texture as usize] =
+                            Some(slot(group, binding).ok_or_else(|| bad(line))?);
+                    }
+                }
+                _ => return Err(bad(line)),
+            }
+        }
+        Ok(())
+    }
+
+    #[cfg(feature = "gles-naga")]
     fn consume_reflection(
         self,
         gl: &glow::Context,
@@ -297,6 +360,7 @@ impl super::Device {
         }
     }
 
+    #[cfg_attr(not(feature = "gles-naga"), allow(unused_variables))]
     fn create_shader(
         gl: &glow::Context,
         naga_stage: naga::ShaderStage,
@@ -305,129 +369,15 @@ impl super::Device {
         program: glow::Program,
         check: bool,
     ) -> Result<glow::Shader, crate::PipelineError> {
-        let source = 'outer: {
-            use naga::back::glsl;
-            let pipeline_options = glsl::PipelineOptions {
-                shader_stage: naga_stage,
-                entry_point: stage.entry_point.to_owned(),
-                multiview: context
-                    .multiview_mask
-                    .map(|a| NonZeroU32::new(a.get().count_ones()).unwrap()),
-            };
-
-            let naga = match stage.module.source {
-                super::ShaderModuleSource::Naga(ref naga) => naga,
-                super::ShaderModuleSource::Passthrough { ref source } => {
-                    break 'outer Cow::Borrowed(source);
-                }
-            };
-
-            let (module, info) = naga::back::pipeline_constants::process_overrides(
-                &naga.module,
-                &naga.info,
-                Some((naga_stage, stage.entry_point)),
-                stage.constants,
-            )
-            .map_err(|e| {
-                let msg = format!("{e}");
-                crate::PipelineError::PipelineConstants(map_naga_stage(naga_stage), msg)
-            })?;
-
-            // In a GLSL ES fragment shader, no struct value: drivers that
-            // evaluate struct members at the stage's default precision
-            // (the Adreno 619's, under ANGLE, which drops `precision`
-            // statements) would read every one, inputs included, at
-            // `mediump` (`naga::back::glsl::flatten_structs`).
-            let flattened = if naga_stage == naga::ShaderStage::Fragment
-                && context.layout.naga_options.version.is_es()
-            {
-                glsl::flatten_structs(&module, &info).ok().and_then(|flat| {
-                    let mut validator = naga::valid::Validator::new(
-                        naga::valid::ValidationFlags::all(),
-                        naga::valid::Capabilities::all(),
-                    );
-                    match validator.validate_resolved_overrides(&flat) {
-                        Ok(info) => Some((flat, info)),
-                        Err(e) => {
-                            log::warn!("flattened structs don't validate: {e}");
-                            None
-                        }
-                    }
-                })
-            } else {
-                None
-            };
-            let (module, info) = match flattened {
-                Some((module, info)) => (Cow::Owned(module), Cow::Owned(info)),
-                None => (module, info),
-            };
-
-            let entry_point_index = module
-                .entry_points
-                .iter()
-                .position(|ep| ep.name.as_str() == stage.entry_point)
-                .ok_or(crate::PipelineError::EntryPoint(naga_stage))?;
-
-            use naga::proc::BoundsCheckPolicy;
-            // The image bounds checks require the TEXTURE_LEVELS feature available in GL core 4.3+.
-            let version = gl.version();
-            let image_check = if !version.is_embedded && (version.major, version.minor) >= (4, 3) {
-                BoundsCheckPolicy::ReadZeroSkipWrite
-            } else {
-                BoundsCheckPolicy::Unchecked
-            };
-
-            // Other bounds check are either provided by glsl or not implemented yet.
-            let policies = naga::proc::BoundsCheckPolicies {
-                index: BoundsCheckPolicy::Unchecked,
-                buffer: BoundsCheckPolicy::Unchecked,
-                image_load: image_check,
-                binding_array: BoundsCheckPolicy::Unchecked,
-            };
-
-            let mut output = String::new();
-            let needs_temp_options = stage.zero_initialize_workgroup_memory
-                != context.layout.naga_options.zero_initialize_workgroup_memory;
-            let mut temp_options;
-            let naga_options = if needs_temp_options {
-                // We use a conditional here, as cloning the naga_options could be expensive
-                // That is, we want to avoid doing that unless we cannot avoid it
-                temp_options = context.layout.naga_options.clone();
-                temp_options.zero_initialize_workgroup_memory =
-                    stage.zero_initialize_workgroup_memory;
-                &temp_options
-            } else {
-                &context.layout.naga_options
-            };
-            let mut writer = glsl::Writer::new(
-                &mut output,
-                &module,
-                &info,
-                naga_options,
-                &pipeline_options,
-                policies,
-            )
-            .map_err(|e| {
-                let msg = format!("{e}");
-                crate::PipelineError::Linkage(map_naga_stage(naga_stage), msg)
-            })?;
-
-            let reflection_info = writer.write().map_err(|e| {
-                let msg = format!("{e}");
-                crate::PipelineError::Linkage(map_naga_stage(naga_stage), msg)
-            })?;
-
-            log::debug!("Naga generated shader:\n{output}");
-
-            context.consume_reflection(
-                gl,
-                &module,
-                info.get_entry_point(entry_point_index),
-                reflection_info,
-                naga_stage,
-                program,
-            );
-            Cow::Owned(output)
+        let source = match stage.module.source {
+            #[cfg(feature = "gles-naga")]
+            super::ShaderModuleSource::Naga(ref naga) => Cow::Owned(Self::write_glsl(
+                gl, naga_stage, stage, naga, context, program,
+            )?),
+            super::ShaderModuleSource::Passthrough { ref source } => {
+                context.consume_binding_lines(source, naga_stage)?;
+                Cow::Borrowed(source.as_str())
+            }
         };
 
         unsafe {
@@ -439,6 +389,132 @@ impl super::Device {
                 check,
             )
         }
+    }
+
+    /// Writes `naga`, `stage`'s module, as GLSL, and takes its bindings.
+    #[cfg(feature = "gles-naga")]
+    fn write_glsl(
+        gl: &glow::Context,
+        naga_stage: naga::ShaderStage,
+        stage: &crate::ProgrammableStage<super::ShaderModule>,
+        naga: &crate::NagaShader,
+        context: CompilationContext,
+        program: glow::Program,
+    ) -> Result<String, crate::PipelineError> {
+        use naga::back::glsl;
+        let pipeline_options = glsl::PipelineOptions {
+            shader_stage: naga_stage,
+            entry_point: stage.entry_point.to_owned(),
+            multiview: context
+                .multiview_mask
+                .map(|a| NonZeroU32::new(a.get().count_ones()).unwrap()),
+        };
+
+        let (module, info) = naga::back::pipeline_constants::process_overrides(
+            &naga.module,
+            &naga.info,
+            Some((naga_stage, stage.entry_point)),
+            stage.constants,
+        )
+        .map_err(|e| {
+            let msg = format!("{e}");
+            crate::PipelineError::PipelineConstants(map_naga_stage(naga_stage), msg)
+        })?;
+
+        // In a GLSL ES fragment shader, no struct value: drivers that
+        // evaluate struct members at the stage's default precision
+        // (the Adreno 619's, under ANGLE, which drops `precision`
+        // statements) would read every one, inputs included, at
+        // `mediump` (`naga::back::glsl::flatten_structs`).
+        let flattened = if naga_stage == naga::ShaderStage::Fragment
+            && context.layout.naga_options.version.is_es()
+        {
+            glsl::flatten_structs(&module, &info).ok().and_then(|flat| {
+                let mut validator = naga::valid::Validator::new(
+                    naga::valid::ValidationFlags::all(),
+                    naga::valid::Capabilities::all(),
+                );
+                match validator.validate_resolved_overrides(&flat) {
+                    Ok(info) => Some((flat, info)),
+                    Err(e) => {
+                        log::warn!("flattened structs don't validate: {e}");
+                        None
+                    }
+                }
+            })
+        } else {
+            None
+        };
+        let (module, info) = match flattened {
+            Some((module, info)) => (Cow::Owned(module), Cow::Owned(info)),
+            None => (module, info),
+        };
+
+        let entry_point_index = module
+            .entry_points
+            .iter()
+            .position(|ep| ep.name.as_str() == stage.entry_point)
+            .ok_or(crate::PipelineError::EntryPoint(naga_stage))?;
+
+        use naga::proc::BoundsCheckPolicy;
+        // The image bounds checks require the TEXTURE_LEVELS feature available in GL core 4.3+.
+        let version = gl.version();
+        let image_check = if !version.is_embedded && (version.major, version.minor) >= (4, 3) {
+            BoundsCheckPolicy::ReadZeroSkipWrite
+        } else {
+            BoundsCheckPolicy::Unchecked
+        };
+
+        // Other bounds check are either provided by glsl or not implemented yet.
+        let policies = naga::proc::BoundsCheckPolicies {
+            index: BoundsCheckPolicy::Unchecked,
+            buffer: BoundsCheckPolicy::Unchecked,
+            image_load: image_check,
+            binding_array: BoundsCheckPolicy::Unchecked,
+        };
+
+        let mut output = String::new();
+        let needs_temp_options = stage.zero_initialize_workgroup_memory
+            != context.layout.naga_options.zero_initialize_workgroup_memory;
+        let mut temp_options;
+        let naga_options = if needs_temp_options {
+            // We use a conditional here, as cloning the naga_options could be expensive
+            // That is, we want to avoid doing that unless we cannot avoid it
+            temp_options = context.layout.naga_options.clone();
+            temp_options.zero_initialize_workgroup_memory = stage.zero_initialize_workgroup_memory;
+            &temp_options
+        } else {
+            &context.layout.naga_options
+        };
+        let mut writer = glsl::Writer::new(
+            &mut output,
+            &module,
+            &info,
+            naga_options,
+            &pipeline_options,
+            policies,
+        )
+        .map_err(|e| {
+            let msg = format!("{e}");
+            crate::PipelineError::Linkage(map_naga_stage(naga_stage), msg)
+        })?;
+
+        let reflection_info = writer.write().map_err(|e| {
+            let msg = format!("{e}");
+            crate::PipelineError::Linkage(map_naga_stage(naga_stage), msg)
+        })?;
+
+        log::debug!("Naga generated shader:\n{output}");
+
+        context.consume_reflection(
+            gl,
+            &module,
+            info.get_entry_point(entry_point_index),
+            reflection_info,
+            naga_stage,
+            program,
+        );
+        Ok(output)
     }
 
     unsafe fn create_pipeline<'a>(
@@ -583,12 +659,19 @@ impl super::Device {
             has_stages,
             shaders: shaders_to_delete,
             name_binding_map,
+            bind_by_name: !private_caps.contains(PrivateCapabilities::SHADER_BINDING_LAYOUT)
+                || shaders.iter().any(|(_, stage)| {
+                    matches!(
+                        stage.module.source,
+                        super::ShaderModuleSource::Passthrough { .. }
+                    )
+                }),
             immediates_items,
         };
         let (linked, deferred) = if defer {
             (super::Linked::default(), Some(link))
         } else {
-            match unsafe { Self::read_link(gl, program, link, private_caps) } {
+            match unsafe { Self::read_link(gl, program, link) } {
                 Ok(linked) => (linked, None),
                 Err(e) => {
                     unsafe { gl.delete_program(program) };
@@ -612,12 +695,12 @@ impl super::Device {
         gl: &glow::Context,
         program: glow::Program,
         link: DeferredLink,
-        private_caps: PrivateCapabilities,
     ) -> Result<super::Linked, crate::PipelineError> {
         let DeferredLink {
             has_stages,
             shaders,
             name_binding_map,
+            bind_by_name,
             immediates_items,
         } = link;
         let linked_ok = unsafe { gl.get_program_link_status(program) };
@@ -643,7 +726,7 @@ impl super::Device {
             log::debug!("\tLink message: {msg}");
         }
 
-        if !private_caps.contains(PrivateCapabilities::SHADER_BINDING_LAYOUT) {
+        if bind_by_name {
             // This remapping is only needed if we aren't able to put the binding layout
             // in the shader. We can't remap storage buffers this way.
             unsafe { gl.use_program(Some(program)) };
@@ -717,6 +800,15 @@ impl super::Device {
         (self.shared.private_caps).contains(PrivateCapabilities::ZERO_TO_ONE_DEPTH)
     }
 
+    /// Whether the context is OpenGL ES's or WebGL's, which take GLSL ES,
+    /// rather than desktop OpenGL's.
+    pub fn is_embedded(&self) -> bool {
+        matches!(
+            self.shared.shading_language_version,
+            naga::back::glsl::Version::Embedded { .. }
+        )
+    }
+
     /// Defers the links of later render pipelines, where programs link in
     /// the background (`KHR_parallel_shader_compile`): their creation
     /// returns without waiting for the driver, and [`Self::poll_link`]
@@ -746,8 +838,7 @@ impl super::Device {
                 *deferred = Some(link);
                 return None;
             }
-            let read =
-                unsafe { Self::read_link(gl, inner.program, link, self.shared.private_caps) };
+            let read = unsafe { Self::read_link(gl, inner.program, link) };
             *inner.linked.lock() = read.unwrap_or_else(|e| super::Linked {
                 error: Some(e.to_string()),
                 ..Default::default()
@@ -765,6 +856,10 @@ pub(super) struct DeferredLink {
     has_stages: wgt::ShaderStages,
     shaders: ArrayVec<(naga::ShaderStage, glow::Shader), { crate::MAX_CONCURRENT_SHADER_STAGES }>,
     name_binding_map: NameBindingMap,
+    /// Whether the program binds `name_binding_map`'s names once linked:
+    /// where its shaders can't say their bindings (`layout(binding = …)`),
+    /// as passthrough GLSL doesn't.
+    bind_by_name: bool,
     immediates_items:
         ArrayVec<Vec<naga::back::glsl::ImmediateItem>, { crate::MAX_CONCURRENT_SHADER_STAGES }>,
 }
@@ -1650,23 +1745,30 @@ impl crate::Device for super::Device {
         desc: &crate::ShaderModuleDescriptor,
         shader: crate::ShaderInput,
     ) -> Result<super::ShaderModule, crate::ShaderError> {
+        let source = match shader {
+            #[cfg(feature = "gles-naga")]
+            crate::ShaderInput::Naga(naga) => super::ShaderModuleSource::Naga(naga),
+            #[cfg(not(feature = "gles-naga"))]
+            crate::ShaderInput::Naga(_) => {
+                return Err(crate::ShaderError::Compilation(
+                    "GLES takes passthrough GLSL alone without the `gles-naga` feature".into(),
+                ))
+            }
+            crate::ShaderInput::Glsl { shader, .. } => super::ShaderModuleSource::Passthrough {
+                source: shader.to_owned(),
+            },
+            crate::ShaderInput::SpirV(_)
+            | crate::ShaderInput::MetalLib { .. }
+            | crate::ShaderInput::Msl { .. }
+            | crate::ShaderInput::Dxil { .. }
+            | crate::ShaderInput::Hlsl { .. } => {
+                unreachable!()
+            }
+        };
         self.counters.shader_modules.add(1);
 
         Ok(super::ShaderModule {
-            source: match shader {
-                crate::ShaderInput::Naga(naga) => super::ShaderModuleSource::Naga(naga),
-                // The backend doesn't yet expose this feature so it should be fine
-                crate::ShaderInput::Glsl { shader, .. } => super::ShaderModuleSource::Passthrough {
-                    source: shader.to_owned(),
-                },
-                crate::ShaderInput::SpirV(_)
-                | crate::ShaderInput::MetalLib { .. }
-                | crate::ShaderInput::Msl { .. }
-                | crate::ShaderInput::Dxil { .. }
-                | crate::ShaderInput::Hlsl { .. } => {
-                    unreachable!()
-                }
-            },
+            source,
             label: desc.label.map(|str| str.to_string()),
             id: self.shared.next_shader_id.fetch_add(1, Ordering::Relaxed),
         })

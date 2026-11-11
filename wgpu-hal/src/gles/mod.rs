@@ -30,6 +30,15 @@ The texture-sampler pairs get potentially invalidated in 2 places:
 We expect that the changes to sampler states between any 2 pipelines of the same layout
 will be minimal, if any.
 
+## Passthrough GLSL
+
+A passthrough module is one stage's GLSL, compiled as given: its source sets
+its own override values. GLSL ES 3.00 can't say which binding a uniform block
+or texture is, so the source names each in comments the device reads (see
+`CompilationContext::consume_binding_lines`), and the program binds them by
+name once linked, whatever the context. Without the `gles-naga` feature,
+GLES takes passthrough modules alone and builds without naga's GLSL writer.
+
 ## Vertex data
 
 Generally, vertex buffers are marked as dirty and lazily bound on draw.
@@ -632,6 +641,7 @@ struct BindGroupLayoutInfo {
 #[derive(Debug)]
 pub struct PipelineLayout {
     group_infos: Box<[Option<BindGroupLayoutInfo>]>,
+    #[cfg_attr(not(feature = "gles-naga"), allow(dead_code))]
     naga_options: naga::back::glsl::Options,
 }
 
@@ -641,6 +651,7 @@ impl PipelineLayout {
     /// # Panics
     /// If the pipeline layout does not contain a bind group layout used by
     /// the resource binding.
+    #[cfg(feature = "gles-naga")]
     fn get_slot(&self, br: &naga::ResourceBinding) -> u8 {
         let group_info = self.group_infos[br.group as usize].as_ref().unwrap();
         group_info.binding_to_slot[br.binding as usize]
@@ -648,6 +659,7 @@ impl PipelineLayout {
 }
 
 #[derive(Debug)]
+#[cfg_attr(not(feature = "gles-naga"), allow(dead_code))]
 enum BindingRegister {
     UniformBuffers,
     StorageBuffers,
@@ -684,8 +696,11 @@ type ShaderId = u32;
 
 #[derive(Debug)]
 pub enum ShaderModuleSource {
+    #[cfg(feature = "gles-naga")]
     Naga(crate::NagaShader),
-    Passthrough { source: String },
+    Passthrough {
+        source: String,
+    },
 }
 
 #[derive(Debug)]
