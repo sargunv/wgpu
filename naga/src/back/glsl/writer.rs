@@ -1064,15 +1064,11 @@ impl<'a, W: Write> Writer<'a, W> {
                 match built_in {
                     crate::BuiltIn::Position { invariant: true } => {
                         match (self.options.version, self.entry_point.stage) {
-                            (
-                                Version::Embedded {
-                                    version: 300,
-                                    is_webgl: true,
-                                },
-                                ShaderStage::Fragment,
-                            ) => {
-                                // `invariant gl_FragCoord` is not allowed in WebGL2 and possibly
-                                // OpenGL ES in general (waiting on confirmation).
+                            (Version::Embedded { .. }, ShaderStage::Fragment) => {
+                                // `invariant gl_FragCoord` is not allowed in GLSL ES:
+                                // "only variables output from a shader can be candidates
+                                // for invariance" (GLSL ES 3.00 and 3.20, 4.6.1), and
+                                // ANGLE rejects it outside WebGL too.
                                 //
                                 // See https://github.com/KhronosGroup/WebGL/issues/3518
                             }
