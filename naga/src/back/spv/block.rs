@@ -815,15 +815,14 @@ impl BlockContext<'_> {
                                 // that `let` bindings are not constant expressions
                                 // (#6396). So eventually we will need to emulate bounds
                                 // checks here.
-                                let id = self.gen_id();
                                 let base_id = self.cached[base];
-                                block.body.push(Instruction::composite_extract(
+                                self.write_composite_extract(
+                                    self.fun_info[expr_handle].ty.handle(),
                                     result_type_id,
-                                    id,
                                     base_id,
-                                    &[value],
-                                ));
-                                id
+                                    &mut alloc::vec![value],
+                                    block,
+                                )
                             }
                             GuardedIndex::Expression(_) => {
                                 // We are subscripting an array or matrix that is not
@@ -926,15 +925,14 @@ impl BlockContext<'_> {
                         // only appear behind pointers, and are thus handled by the
                         // `is_intermediate` case above. Everything else's size is
                         // statically known and checked in validation.
-                        let id = self.gen_id();
                         let base_id = self.cached[base];
-                        block.body.push(Instruction::composite_extract(
+                        self.write_composite_extract(
+                            self.fun_info[expr_handle].ty.handle(),
                             result_type_id,
-                            id,
                             base_id,
-                            &[index],
-                        ));
-                        id
+                            &mut alloc::vec![index],
+                            block,
+                        )
                     }
                     crate::TypeInner::BindingArray {
                         base: binding_type, ..
@@ -2762,6 +2760,69 @@ impl BlockContext<'_> {
             None => {
                 // Start a fresh chain of checks.
                 *chain = Some(comparison_id);
+            }
+        }
+    }
+
+    /// `OpCompositeExtract` of the element of `base_id` at `indices`, whose
+    /// type is `ty` (`result_type_id`). A struct is instead put together
+    /// from its members' extracts with `OpCompositeConstruct`.
+    ///
+    /// Qualcomm's Adreno 830 Vulkan compiler (driver 0800.64.8) fails to
+    /// link a vertex stage that takes a struct out of a struct function
+    /// parameter with one `OpCompositeExtract` and branches on it in a
+    /// callee that loops: a uniform's struct passed by value and its member
+    /// struct passed on. `vkCreateGraphicsPipelines` returns
+    /// `VK_ERROR_UNKNOWN` ("Failed to link shaders"). The same values put
+    /// together member by member link, as do the same extracts from types
+    /// without explicit layout (what glslang and Tint pass between
+    /// functions). The cost is a few extracts the driver folds away.
+    fn write_composite_extract(
+        &mut self,
+        ty: Option<Handle<crate::Type>>,
+        result_type_id: Word,
+        base_id: Word,
+        indices: &mut Vec<Word>,
+        block: &mut Block,
+    ) -> Word {
+        let members = ty.and_then(|ty| match self.ir_module.types[ty].inner {
+            crate::TypeInner::Struct { ref members, .. } => {
+                Some(members.iter().map(|m| m.ty).collect::<Vec<_>>())
+            }
+            _ => None,
+        });
+        match members {
+            Some(members) => {
+                let mut constituents = Vec::with_capacity(members.len());
+                for (index, member) in members.into_iter().enumerate() {
+                    indices.push(index as Word);
+                    let member_type_id = self.get_handle_type_id(member);
+                    constituents.push(self.write_composite_extract(
+                        Some(member),
+                        member_type_id,
+                        base_id,
+                        indices,
+                        block,
+                    ));
+                    indices.pop();
+                }
+                let id = self.gen_id();
+                block.body.push(Instruction::composite_construct(
+                    result_type_id,
+                    id,
+                    &constituents,
+                ));
+                id
+            }
+            None => {
+                let id = self.gen_id();
+                block.body.push(Instruction::composite_extract(
+                    result_type_id,
+                    id,
+                    base_id,
+                    indices,
+                ));
+                id
             }
         }
     }
