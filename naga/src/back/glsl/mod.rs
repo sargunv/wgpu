@@ -169,6 +169,10 @@ bitflags::bitflags! {
         /// The variable gl_PointSize is intended for a shader to write the size of the point to be rasterized. It is measured in pixels.
         /// If gl_PointSize is not written to, its value is undefined in subsequent pipe stages.
         const FORCE_POINT_SIZE = 0x20;
+        /// The host clips depth from 0 to 1, as WebGPU does
+        /// (`glClipControl`'s `GL_ZERO_TO_ONE`): [`Self::ADJUST_COORDINATE_SPACE`]
+        /// then flips Y and leaves Z alone.
+        const ZERO_TO_ONE_DEPTH = 0x40;
     }
 }
 

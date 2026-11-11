@@ -679,6 +679,15 @@ impl super::Device {
         })
     }
 
+    /// Whether the context clips depth from 0 to 1, as WebGPU does
+    /// (`EXT_clip_control`, `ARB_clip_control` or GL 4.5): shaders then
+    /// write depth as they compute it, rather than remapped into GL's
+    /// -1 to 1, which spends a reversed depth's precision far from the
+    /// camera.
+    pub fn zero_to_one_depth(&self) -> bool {
+        (self.shared.private_caps).contains(PrivateCapabilities::ZERO_TO_ONE_DEPTH)
+    }
+
     /// Defers the links of later render pipelines, where programs link in
     /// the background (`KHR_parallel_shader_compile`): their creation
     /// returns without waiting for the driver, and [`Self::poll_link`]
@@ -1425,6 +1434,12 @@ impl crate::Device for super::Device {
         let mut num_storage_buffers = 0u8;
 
         let mut writer_flags = glsl::WriterFlags::ADJUST_COORDINATE_SPACE;
+        writer_flags.set(
+            glsl::WriterFlags::ZERO_TO_ONE_DEPTH,
+            self.shared
+                .private_caps
+                .contains(PrivateCapabilities::ZERO_TO_ONE_DEPTH),
+        );
         writer_flags.set(
             glsl::WriterFlags::TEXTURE_SHADOW_LOD,
             self.shared

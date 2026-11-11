@@ -13,6 +13,67 @@ use crate::gles::ShaderClearProgram;
 const GL_UNMASKED_VENDOR_WEBGL: u32 = 0x9245;
 const GL_UNMASKED_RENDERER_WEBGL: u32 = 0x9246;
 
+/// Has `context` clip depth from 0 to 1, as WebGPU does, with GL's own
+/// lower-left origin (`glClipControl(GL_LOWER_LEFT, GL_ZERO_TO_ONE)`)
+/// where it can: `EXT_clip_control` on WebGL 2 and GLES, GL 4.5 or
+/// `ARB_clip_control`. Returns whether it does. Nothing else sets the
+/// clip control, so the context keeps it.
+///
+/// # Safety
+///
+/// `context` must be current.
+#[cfg_attr(windows, allow(unused_variables))]
+unsafe fn clip_depth_zero_to_one(
+    context: &super::AdapterContext,
+    extensions: &std::collections::HashSet<String>,
+    full_ver: Option<(u8, u8)>,
+) -> bool {
+    const LOWER_LEFT: u32 = 0x8CA1;
+    const ZERO_TO_ONE: u32 = 0x935F;
+    #[cfg(webgl)]
+    {
+        use wasm_bindgen::JsCast as _;
+        let _ = full_ver;
+        if !extensions.contains("EXT_clip_control") {
+            return false;
+        }
+        let Ok(Some(extension)) = context.webgl2_context.get_extension("EXT_clip_control") else {
+            return false;
+        };
+        js_sys::Reflect::get(&extension, &"clipControlEXT".into())
+            .ok()
+            .and_then(|f| f.dyn_into::<js_sys::Function>().ok())
+            .is_some_and(|f| {
+                f.call2(&extension, &LOWER_LEFT.into(), &ZERO_TO_ONE.into())
+                    .is_ok()
+            })
+    }
+    #[cfg(not(any(windows, webgl)))]
+    {
+        let name = if full_ver.is_some_and(|v| v >= (4, 5))
+            || extensions.contains("GL_ARB_clip_control")
+        {
+            "glClipControl"
+        } else if extensions.contains("GL_EXT_clip_control") {
+            "glClipControlEXT"
+        } else {
+            return false;
+        };
+        let Some(function) = context
+            .egl_instance()
+            .and_then(|egl| egl.get_proc_address(name))
+        else {
+            return false;
+        };
+        // SAFETY: `glClipControl` and `glClipControlEXT` take two enums.
+        let clip_control: extern "system" fn(u32, u32) = unsafe { core::mem::transmute(function) };
+        clip_control(LOWER_LEFT, ZERO_TO_ONE);
+        true
+    }
+    #[cfg(windows)]
+    false
+}
+
 impl super::Adapter {
     pub fn get_glsl_version(&self) -> naga::back::glsl::Version {
         self.shared.shading_language_version
@@ -939,6 +1000,9 @@ impl super::Adapter {
         let max_samples = unsafe { gl.get_parameter_i32(glow::MAX_SAMPLES) };
         let parallel_compile = extensions.contains("GL_KHR_parallel_shader_compile")
             || extensions.contains("KHR_parallel_shader_compile");
+        private_caps.set(super::PrivateCapabilities::ZERO_TO_ONE_DEPTH, unsafe {
+            clip_depth_zero_to_one(&context, extensions, full_ver)
+        });
 
         // Drop the GL guard so we can move the context into AdapterShared
         // ( on Wasm the gl handle is just a ref so we tell clippy to allow

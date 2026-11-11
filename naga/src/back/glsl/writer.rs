@@ -1960,10 +1960,18 @@ impl<'a, W: Write> Writer<'a, W> {
                                 .writer_flags
                                 .contains(WriterFlags::ADJUST_COORDINATE_SPACE)
                         {
-                            writeln!(
-                                self.out,
-                                "gl_Position.yz = vec2(-gl_Position.y, gl_Position.z * 2.0 - gl_Position.w);",
-                            )?;
+                            if self
+                                .options
+                                .writer_flags
+                                .contains(WriterFlags::ZERO_TO_ONE_DEPTH)
+                            {
+                                writeln!(self.out, "gl_Position.y = -gl_Position.y;")?;
+                            } else {
+                                writeln!(
+                                    self.out,
+                                    "gl_Position.yz = vec2(-gl_Position.y, gl_Position.z * 2.0 - gl_Position.w);",
+                                )?;
+                            }
                             write!(self.out, "{level}")?;
                         }
 

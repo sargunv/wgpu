@@ -249,6 +249,9 @@ bitflags::bitflags! {
         /// `GL_ARB_shader_image_load_store`; GLES needs `GL_NV_image_formats`
         /// (which itself depends on `GL_EXT_texture_norm16`).
         const TEXTURE_FORMAT_NORM16_STORAGE = 1 << 20;
+        /// The context clips depth from 0 to 1 (`glClipControl`'s
+        /// `GL_ZERO_TO_ONE`), as WebGPU does: shaders leave depth alone.
+        const ZERO_TO_ONE_DEPTH = 1 << 21;
     }
 }
 
