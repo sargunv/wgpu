@@ -257,7 +257,32 @@ impl Writer {
                 }
             };
 
-            self.store_io_with_f16_polyfill(body, res_member.id, member_value_id);
+            match res_member.array {
+                // A built-in array, element by element (`builtin_output_array`).
+                Some((element_type_id, length)) => {
+                    let pointer_type_id =
+                        self.get_pointer_type_id(element_type_id, spirv::StorageClass::Output);
+                    for index in 0..length {
+                        let element_id = self.id_gen.next();
+                        body.push(Instruction::composite_extract(
+                            element_type_id,
+                            element_id,
+                            member_value_id,
+                            &[index],
+                        ));
+                        let index_id = self.get_index_constant(index);
+                        let pointer_id = self.id_gen.next();
+                        body.push(Instruction::access_chain(
+                            pointer_type_id,
+                            pointer_id,
+                            res_member.id,
+                            &[index_id],
+                        ));
+                        body.push(Instruction::store(pointer_id, element_id, None));
+                    }
+                }
+                None => self.store_io_with_f16_polyfill(body, res_member.id, member_value_id),
+            }
 
             match res_member.built_in {
                 Some(crate::BuiltIn::Position { .. })

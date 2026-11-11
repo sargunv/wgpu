@@ -239,6 +239,9 @@ struct ResultMember {
     id: Word,
     type_id: Word,
     built_in: Option<crate::BuiltIn>,
+    /// A built-in output array's element type and length: the entry point
+    /// stores it element by element ([`Writer::builtin_output_array`]).
+    array: Option<(Word, u32)>,
 }
 
 struct EntryPointContext {

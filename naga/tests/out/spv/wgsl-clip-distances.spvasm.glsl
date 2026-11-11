@@ -13,6 +13,6 @@ void main()
     _8 _17 = _8(vec4(0.0), float[](0.0));
     _17._m1[0u] = 0.5;
     gl_Position = _17._m0;
-    gl_ClipDistance = _17._m1;
+    gl_ClipDistance[0u] = _17._m1[0];
 }
 

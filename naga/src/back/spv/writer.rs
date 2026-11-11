@@ -1444,10 +1444,12 @@ impl Writer {
                                 iface.varying_ids.push(varying_id);
                                 varying_id
                             };
+                        let array = self.builtin_output_array(ir_module, result.ty, binding);
                         ep_context.results.push(ResultMember {
                             id: varying_id,
                             type_id,
                             built_in: binding.to_built_in(),
+                            array,
                         });
                     } else if let crate::TypeInner::Struct { ref members, .. } =
                         ir_module.types[result.ty].inner
@@ -1477,10 +1479,12 @@ impl Writer {
                                 iface.varying_ids.push(varying_id);
                                 varying_id
                             };
+                            let array = self.builtin_output_array(ir_module, member.ty, binding);
                             ep_context.results.push(ResultMember {
                                 id: varying_id,
                                 type_id,
                                 built_in: binding.to_built_in(),
+                                array,
                             });
                         }
                     } else {
@@ -3592,6 +3596,34 @@ impl Writer {
     }
 
     /// Store an IO variable, converting from `f16` to `f32` if polyfill is active.
+    /// The element type and length of `ty` when `binding` makes it a
+    /// built-in output array (`ClipDistance`, `CullDistance`), which the
+    /// entry point stores element by element.
+    ///
+    /// Qualcomm's Adreno X1 Vulkan compiler (driver 31.0.133.1) fails to
+    /// link a vertex stage that stores its clip distances with one
+    /// `OpStore` of the whole array: `vkCreateGraphicsPipelines` returns
+    /// `VK_ERROR_UNKNOWN`. The same stage storing each element through an
+    /// `OpAccessChain` links, as glslang writes `gl_ClipDistance[i] = …`.
+    fn builtin_output_array(
+        &mut self,
+        ir_module: &crate::Module,
+        ty: Handle<crate::Type>,
+        binding: &crate::Binding,
+    ) -> Option<(Word, u32)> {
+        let crate::Binding::BuiltIn(_) = *binding else {
+            return None;
+        };
+        match ir_module.types[ty].inner {
+            crate::TypeInner::Array {
+                base,
+                size: crate::ArraySize::Constant(length),
+                ..
+            } => Some((self.get_handle_type_id(base), length.get())),
+            _ => None,
+        }
+    }
+
     pub(super) fn store_io_with_f16_polyfill(
         &mut self,
         body: &mut Vec<Instruction>,
