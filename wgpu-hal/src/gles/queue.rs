@@ -85,6 +85,63 @@ impl super::Queue {
         }
     }
 
+    /// Blits the read framebuffer's `copy` source rectangle into a new 2D
+    /// texture of `format`, at its origin, and attaches that to the read
+    /// framebuffer in its place. The caller deletes the texture.
+    unsafe fn stage_layer(
+        &self,
+        gl: &glow::Context,
+        format: wgt::TextureFormat,
+        copy: &crate::TextureCopy,
+    ) -> glow::Texture {
+        let (w, h) = (copy.size.width as i32, copy.size.height as i32);
+        let (x, y) = (copy.src_base.origin.x as i32, copy.src_base.origin.y as i32);
+        let internal = self.shared.describe_texture_format(format).internal;
+        let texture = unsafe { gl.create_texture() }.expect("a staging texture");
+        unsafe { gl.bind_texture(glow::TEXTURE_2D, Some(texture)) };
+        unsafe { gl.tex_storage_2d(glow::TEXTURE_2D, 1, internal, w, h) };
+        let fbo = unsafe { gl.create_framebuffer() }.expect("a staging framebuffer");
+        unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(fbo)) };
+        unsafe {
+            gl.framebuffer_texture_2d(
+                glow::DRAW_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(texture),
+                0,
+            )
+        };
+        // Blits pass the scissor test; a pass may have left it on.
+        unsafe { gl.disable(glow::SCISSOR_TEST) };
+        unsafe {
+            gl.blit_framebuffer(
+                x,
+                y,
+                x + w,
+                y + h,
+                0,
+                0,
+                w,
+                h,
+                glow::COLOR_BUFFER_BIT,
+                glow::NEAREST,
+            )
+        };
+        // As a resolve leaves it: passes bind their own framebuffer.
+        unsafe { gl.bind_framebuffer(glow::DRAW_FRAMEBUFFER, Some(self.draw_fbo)) };
+        unsafe { gl.delete_framebuffer(fbo) };
+        unsafe {
+            gl.framebuffer_texture_2d(
+                glow::READ_FRAMEBUFFER,
+                glow::COLOR_ATTACHMENT0,
+                glow::TEXTURE_2D,
+                Some(texture),
+                0,
+            )
+        };
+        texture
+    }
+
     unsafe fn reset_state(&self, gl: &glow::Context) {
         unsafe { gl.use_program(None) };
         unsafe { gl.bind_framebuffer(glow::FRAMEBUFFER, None) };
@@ -713,10 +770,13 @@ impl super::Queue {
                 src_target,
                 dst,
                 dst_target,
+                format,
                 ref copy,
             } => {
                 //TODO: handle 3D copies
                 unsafe { gl.bind_framebuffer(glow::READ_FRAMEBUFFER, Some(self.copy_fbo)) };
+                let mut src_origin = (copy.src_base.origin.x, copy.src_base.origin.y);
+                let mut staging = None;
                 if is_layered_target(src_target) {
                     //TODO: handle GLES without framebuffer_texture_3d
                     unsafe {
@@ -728,6 +788,15 @@ impl super::Queue {
                             copy.src_base.array_layer as i32,
                         )
                     };
+                    // Some drivers copy a layered read attachment's layer
+                    // 0 whatever layer is attached (the Adreno 619's GLES,
+                    // under Chrome's ANGLE), but blit from the attached
+                    // layer: so a colour layer is blitted into a 2D
+                    // texture and copied from there.
+                    if !format.is_depth_stencil_format() && !format.is_compressed() {
+                        staging = Some(unsafe { self.stage_layer(gl, format, copy) });
+                        src_origin = (0, 0);
+                    }
                 } else {
                     unsafe {
                         gl.framebuffer_texture_2d(
@@ -749,8 +818,8 @@ impl super::Queue {
                             copy.dst_base.origin.x as i32,
                             copy.dst_base.origin.y as i32,
                             get_z_offset(dst_target, &copy.dst_base) as i32,
-                            copy.src_base.origin.x as i32,
-                            copy.src_base.origin.y as i32,
+                            src_origin.0 as i32,
+                            src_origin.1 as i32,
                             copy.size.width as i32,
                             copy.size.height as i32,
                         )
@@ -762,12 +831,15 @@ impl super::Queue {
                             copy.dst_base.mip_level as i32,
                             copy.dst_base.origin.x as i32,
                             copy.dst_base.origin.y as i32,
-                            copy.src_base.origin.x as i32,
-                            copy.src_base.origin.y as i32,
+                            src_origin.0 as i32,
+                            src_origin.1 as i32,
                             copy.size.width as i32,
                             copy.size.height as i32,
                         )
                     };
+                }
+                if let Some(texture) = staging {
+                    unsafe { gl.delete_texture(texture) };
                 }
             }
             C::CopyBufferToTexture {
