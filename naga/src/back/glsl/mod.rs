@@ -46,6 +46,7 @@ to output a [`Module`](crate::Module) into glsl
 pub use nt::glsl::*;
 
 pub use features::Features;
+pub use flatten::{flatten_structs, FlattenError};
 pub use writer::Writer;
 
 use alloc::{
@@ -76,6 +77,8 @@ use features::FeaturesManager;
 mod conv;
 /// Contains the features related code and the features querying method
 mod features;
+/// Struct values in functions split into their members.
+mod flatten;
 /// Contains a constant with a slice of all the reserved keywords RESERVED_KEYWORDS
 mod keywords;
 /// Contains the [`Writer`] type.

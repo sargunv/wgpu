@@ -333,6 +333,35 @@ impl super::Device {
                 crate::PipelineError::PipelineConstants(map_naga_stage(naga_stage), msg)
             })?;
 
+            // In a GLSL ES fragment shader, no struct value: drivers that
+            // evaluate struct members at the stage's default precision
+            // (the Adreno 619's, under ANGLE, which drops `precision`
+            // statements) would read every one, inputs included, at
+            // `mediump` (`naga::back::glsl::flatten_structs`).
+            let flattened = if naga_stage == naga::ShaderStage::Fragment
+                && context.layout.naga_options.version.is_es()
+            {
+                glsl::flatten_structs(&module, &info).ok().and_then(|flat| {
+                    let mut validator = naga::valid::Validator::new(
+                        naga::valid::ValidationFlags::all(),
+                        naga::valid::Capabilities::all(),
+                    );
+                    match validator.validate_resolved_overrides(&flat) {
+                        Ok(info) => Some((flat, info)),
+                        Err(e) => {
+                            log::warn!("flattened structs don't validate: {e}");
+                            None
+                        }
+                    }
+                })
+            } else {
+                None
+            };
+            let (module, info) = match flattened {
+                Some((module, info)) => (Cow::Owned(module), Cow::Owned(info)),
+                None => (module, info),
+            };
+
             let entry_point_index = module
                 .entry_points
                 .iter()
