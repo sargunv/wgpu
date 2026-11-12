@@ -420,6 +420,44 @@ impl Device {
         }
     }
 
+    /// Wraps a [`webgpu::GpuRenderPipeline`] the browser made, as
+    /// `createRenderPipelineAsync` resolves one, as a [`RenderPipeline`]
+    /// without making it again.
+    ///
+    /// The async counterpart of [`Self::create_render_pipeline`], which
+    /// wgpu has no portable form of yet (gfx-rs/wgpu#3794): a caller that
+    /// compiles through the browser's async call keeps what it returned
+    /// rather than asking for the same pipeline synchronously, which a
+    /// browser without a content-keyed pipeline cache compiles again.
+    ///
+    /// The caller must guarantee that `pipeline` was produced by the same
+    /// underlying `GpuDevice` that this `Device` wraps. The browser checks
+    /// every use of it against its layout.
+    #[cfg(webgpu)]
+    #[must_use]
+    pub fn create_render_pipeline_from_webgpu_handle(
+        &self,
+        pipeline: webgpu::GpuRenderPipeline,
+    ) -> RenderPipeline {
+        RenderPipeline {
+            inner: self.inner.as_webgpu().wrap_render_pipeline(pipeline),
+        }
+    }
+
+    /// Wraps a [`webgpu::GpuComputePipeline`] the browser made, as
+    /// `createComputePipelineAsync` resolves one, as a [`ComputePipeline`]
+    /// without making it again ([`Self::create_render_pipeline_from_webgpu_handle`]).
+    #[cfg(webgpu)]
+    #[must_use]
+    pub fn create_compute_pipeline_from_webgpu_handle(
+        &self,
+        pipeline: webgpu::GpuComputePipeline,
+    ) -> ComputePipeline {
+        ComputePipeline {
+            inner: self.inner.as_webgpu().wrap_compute_pipeline(pipeline),
+        }
+    }
+
     /// Returns the underlying [`webgpu::GpuDevice`] handle if this `Device`
     /// is on the WebGPU backend, otherwise `None`.
     #[cfg(webgpu)]

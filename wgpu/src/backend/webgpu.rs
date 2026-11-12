@@ -1880,6 +1880,33 @@ impl WebDevice {
         }
         .into()
     }
+
+    /// Wrap a `webgpu_sys::GpuRenderPipeline` the browser made (from
+    /// `createRenderPipelineAsync`) as a dispatch-level `WebRenderPipeline`,
+    /// without making it again with `createRenderPipeline`.
+    pub(crate) fn wrap_render_pipeline(
+        &self,
+        pipeline: webgpu_sys::GpuRenderPipeline,
+    ) -> dispatch::DispatchRenderPipeline {
+        WebRenderPipeline {
+            inner: pipeline,
+            ident: crate::cmp::Identifier::create(),
+        }
+        .into()
+    }
+
+    /// Wrap a `webgpu_sys::GpuComputePipeline` the browser made (from
+    /// `createComputePipelineAsync`) as a dispatch-level `WebComputePipeline`.
+    pub(crate) fn wrap_compute_pipeline(
+        &self,
+        pipeline: webgpu_sys::GpuComputePipeline,
+    ) -> dispatch::DispatchComputePipeline {
+        WebComputePipeline {
+            inner: pipeline,
+            ident: crate::cmp::Identifier::create(),
+        }
+        .into()
+    }
 }
 
 impl dispatch::DeviceInterface for WebDevice {
